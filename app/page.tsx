@@ -4,6 +4,7 @@ import { useState, useEffect, useMemo, useCallback } from 'react'
 import type {
   Activity, AccountingCompany, ArtemCompany, DailyComment,
   Employee, CompanyRow, SystemTotals, DocumentRecord,
+  ArmSoftInvoice, ArmSoftDocument, TaxForm, TaxServiceInvoice,
 } from '@/lib/types'
 
 // ─── Local types ──────────────────────────────────────────────────────────────
@@ -17,6 +18,8 @@ type CellClickParams = {
   document_type: DocType
   date_from: string
   date_to: string
+  armsoft_company_id: number | null
+  tax_account_id: number | null
 }
 
 type MetricContext = {
@@ -25,6 +28,8 @@ type MetricContext = {
   system_source: string
   date_from: string
   date_to: string
+  armsoft_company_id: number | null
+  tax_account_id: number | null
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -59,6 +64,18 @@ function nDaysAgo(n: number) {
 function fmtDate(iso: string) {
   if (!iso) return '—'
   const [y, m, d] = iso.split('-'); return `${d}.${m}.${y}`
+}
+function fmtDateTime(iso: string | null) {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  if (isNaN(d.getTime())) return iso
+  return d.toLocaleDateString('ru-RU') + ' ' + d.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' })
+}
+function fmtMoney(v: number | string | null) {
+  if (v == null) return '—'
+  const n = typeof v === 'string' ? parseFloat(v) : v
+  if (isNaN(n)) return String(v)
+  return n.toLocaleString('ru-RU', { minimumFractionDigits: 0, maximumFractionDigits: 2 })
 }
 function emptyTotals(): SystemTotals { return { invoices: 0, reports: 0, applications: 0, balance: 0 } }
 
@@ -112,6 +129,16 @@ function Avatar({ name }: { name: string }) {
   )
 }
 
+function StatusBadge({ status }: { status: string | null }) {
+  if (!status) return null
+  const s = status.toUpperCase()
+  const cls = s === 'APPROVED' ? 'bg-emerald-100 text-emerald-700'
+    : s === 'REJECTED' ? 'bg-rose-100 text-rose-700'
+    : s === 'PENDING' ? 'bg-amber-100 text-amber-700'
+    : 'bg-slate-100 text-slate-600'
+  return <span className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-semibold ${cls}`}>{status}</span>
+}
+
 function MetricGrid({ t, dim, context, onCellClick }: {
   t: SystemTotals
   dim?: boolean
@@ -151,57 +178,101 @@ function MetricGrid({ t, dim, context, onCellClick }: {
 
 // ─── Document Detail Modal ─────────────────────────────────────────────────────
 
+type ModalTab = 'activity' | 'armsoft_invoices' | 'armsoft_docs' | 'tax_forms' | 'tax_invoices' | 'manual_docs'
+
 function DocumentDetailModal({ params, onClose }: { params: CellClickParams; onClose: () => void }) {
-  const [acts, setActs]   = useState<Activity[]>([])
-  const [docs, setDocs]   = useState<DocumentRecord[]>([])
-  const [loading, setLoading]       = useState(true)
-  const [fetchError, setFetchError] = useState('')
+  const [acts,         setActs]        = useState<Activity[]>([])
+  const [armsoftInvs,  setArmsoftInvs] = useState<ArmSoftInvoice[]>([])
+  const [armsoftDocs,  setArmsoftDocs] = useState<ArmSoftDocument[]>([])
+  const [taxForms,     setTaxForms]    = useState<TaxForm[]>([])
+  const [taxInvs,      setTaxInvs]     = useState<TaxServiceInvoice[]>([])
+  const [manualDocs,   setManualDocs]  = useState<DocumentRecord[]>([])
+  const [loading,      setLoading]     = useState(true)
+  const [fetchError,   setFetchError]  = useState('')
+
+  const [activeTab, setActiveTab] = useState<ModalTab>('activity')
+
   const [showAddForm, setShowAddForm] = useState(false)
   const [addForm, setAddForm] = useState({
-    document_number: '',
-    document_date: today(),
-    description: '',
-    amount: '',
-    period: '',
-    notes: '',
+    document_number: '', document_date: today(), description: '', amount: '', period: '', notes: '',
   })
-  const [saving, setSaving]     = useState(false)
-  const [saveError, setSaveError] = useState('')
+  const [saving,     setSaving]    = useState(false)
+  const [saveError,  setSaveError] = useState('')
 
   const fetchAll = useCallback(async () => {
     setLoading(true); setFetchError('')
     try {
+      const base = { from: params.date_from, to: params.date_to }
+
+      // Always fetch activity breakdown
       const ap = new URLSearchParams({
-        from: params.date_from,
-        to: params.date_to,
+        ...base,
         company: params.company_name,
         accountant: params.accountant_name !== '—' ? params.accountant_name : 'all',
       })
       if (params.system_source !== 'all') ap.set('source', params.system_source)
 
+      // Manual docs
       const dp = new URLSearchParams({
         company_name: params.company_name,
         document_type: params.document_type,
-        from: params.date_from,
-        to: params.date_to,
+        ...base,
       })
       if (params.system_source !== 'all') dp.set('system_source', params.system_source)
       if (params.accountant_name !== '—') dp.set('accountant_name', params.accountant_name)
 
-      const [ar, dr] = await Promise.all([
+      const fetches: Promise<Response>[] = [
         fetch(`/api/activities?${ap}`),
         fetch(`/api/documents?${dp}`),
-      ])
-      const [actData, docData] = await Promise.all([ar.json(), dr.json()])
-      if (!ar.ok) { setFetchError(actData.error ?? 'Ошибка'); return }
-      if (!dr.ok) { setFetchError(docData.error ?? 'Ошибка'); return }
+      ]
+
+      // Real armsoft data
+      if (params.armsoft_company_id) {
+        const aip = new URLSearchParams({ armsoft_company_id: String(params.armsoft_company_id), ...base })
+        fetches.push(fetch(`/api/armsoft/invoices?${aip}`))
+        const adp = new URLSearchParams({ armsoft_company_id: String(params.armsoft_company_id), ...base })
+        fetches.push(fetch(`/api/armsoft/documents?${adp}`))
+      }
+
+      // Real taxservice data
+      if (params.tax_account_id) {
+        const tfp = new URLSearchParams({ tax_account_id: String(params.tax_account_id), ...base })
+        fetches.push(fetch(`/api/taxservice/forms?${tfp}`))
+        const tip = new URLSearchParams({ tax_account_id: String(params.tax_account_id), ...base })
+        fetches.push(fetch(`/api/taxservice/invoices?${tip}`))
+      }
+
+      const responses = await Promise.all(fetches)
+      const jsons = await Promise.all(responses.map(r => r.json()))
+
+      let idx = 0
+      const actData  = jsons[idx++]
+      const docData  = jsons[idx++]
 
       const field = DOC_FIELD[params.document_type]
       const relevant = (Array.isArray(actData) ? actData as Activity[] : [])
         .filter(a => (a[field] as number) > 0)
         .sort((a, b) => b.activity_date.localeCompare(a.activity_date))
       setActs(relevant)
-      setDocs(Array.isArray(docData) ? docData : [])
+      setManualDocs(Array.isArray(docData) ? docData : [])
+
+      if (params.armsoft_company_id) {
+        setArmsoftInvs(Array.isArray(jsons[idx]) ? jsons[idx] : []); idx++
+        setArmsoftDocs(Array.isArray(jsons[idx]) ? jsons[idx] : []); idx++
+      }
+      if (params.tax_account_id) {
+        setTaxForms(Array.isArray(jsons[idx]) ? jsons[idx] : []); idx++
+        setTaxInvs(Array.isArray(jsons[idx]) ? jsons[idx] : [])
+      }
+
+      // Auto-select best tab
+      if (params.armsoft_company_id && params.system_source === 'armsoft') {
+        setActiveTab(params.document_type === 'invoice' ? 'armsoft_invoices' : 'armsoft_docs')
+      } else if (params.tax_account_id && params.system_source === 'taxservice') {
+        setActiveTab(params.document_type === 'invoice' ? 'tax_invoices' : 'tax_forms')
+      } else {
+        setActiveTab('activity')
+      }
     } catch (e) {
       setFetchError(String(e))
     } finally {
@@ -227,9 +298,7 @@ function DocumentDetailModal({ params, onClose }: { params: CellClickParams; onC
         notes: addForm.notes || null,
       }
       const res = await fetch('/api/documents', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
       })
       if (!res.ok) { const e = await res.json(); throw new Error(e.error ?? 'Ошибка') }
       setShowAddForm(false)
@@ -242,16 +311,23 @@ function DocumentDetailModal({ params, onClose }: { params: CellClickParams; onC
     }
   }
 
-  const sysLabel = params.system_source !== 'all'
-    ? (SRC_LABEL[params.system_source] ?? params.system_source)
-    : 'Все системы'
+  const sysLabel = params.system_source !== 'all' ? (SRC_LABEL[params.system_source] ?? params.system_source) : 'Все системы'
   const field = DOC_FIELD[params.document_type]
-  const totalCount = acts.reduce((s, a) => s + (a[field] as number), 0)
+  const totalActivityCount = acts.reduce((s, a) => s + (a[field] as number), 0)
+
+  const tabs: { key: ModalTab; label: string; count: number; show: boolean }[] = [
+    { key: 'activity',       label: 'Активность по дням',   count: acts.length,       show: true },
+    { key: 'armsoft_invoices', label: 'АрмСофт: Инвойсы',   count: armsoftInvs.length, show: !!params.armsoft_company_id },
+    { key: 'armsoft_docs',   label: 'АрмСофт: Документы',   count: armsoftDocs.length, show: !!params.armsoft_company_id },
+    { key: 'tax_forms',      label: 'ТаксСервис: Формы',    count: taxForms.length,   show: !!params.tax_account_id },
+    { key: 'tax_invoices',   label: 'ТаксСервис: Инвойсы',  count: taxInvs.length,    show: !!params.tax_account_id },
+    { key: 'manual_docs',    label: 'Прикреплённые',         count: manualDocs.length, show: true },
+  ]
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
       <div
-        className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[88vh] flex flex-col"
+        className="bg-white rounded-2xl shadow-2xl w-full max-w-4xl max-h-[92vh] flex flex-col"
         onClick={e => e.stopPropagation()}
       >
         {/* Header */}
@@ -262,7 +338,7 @@ function DocumentDetailModal({ params, onClose }: { params: CellClickParams; onC
                 <span className="text-xl">{DOC_TYPE_ICON[params.document_type]}</span>
                 <h2 className="font-bold text-slate-900 text-lg leading-tight">{DOC_TYPE_LABEL[params.document_type]}</h2>
                 <span className="text-slate-300 font-light text-lg">·</span>
-                <span className="font-semibold text-slate-700 text-lg leading-tight truncate max-w-[260px]">{params.company_name}</span>
+                <span className="font-semibold text-slate-700 text-lg leading-tight truncate max-w-[280px]">{params.company_name}</span>
               </div>
               <div className="flex flex-wrap gap-2 items-center">
                 <SourcePill src={params.system_source} />
@@ -273,196 +349,380 @@ function DocumentDetailModal({ params, onClose }: { params: CellClickParams; onC
                     <span className="text-xs text-slate-600">{params.accountant_name}</span>
                   </div>
                 )}
+                {params.armsoft_company_id && (
+                  <span className="text-[10px] text-violet-500 bg-violet-50 px-2 py-0.5 rounded-full">
+                    ArmSoft ID: {params.armsoft_company_id}
+                  </span>
+                )}
+                {params.tax_account_id && (
+                  <span className="text-[10px] text-emerald-500 bg-emerald-50 px-2 py-0.5 rounded-full">
+                    Tax ID: {params.tax_account_id}
+                  </span>
+                )}
               </div>
             </div>
             <button onClick={onClose} className="text-slate-400 hover:text-slate-600 text-2xl leading-none flex-shrink-0 mt-0.5">×</button>
           </div>
         </div>
 
-        {/* Scrollable body */}
-        <div className="flex-1 overflow-y-auto min-h-0">
-          {loading ? (
-            <div className="flex justify-center py-16"><Spinner /></div>
-          ) : fetchError ? (
-            <div className="px-6 py-8 text-center text-rose-500 text-sm">{fetchError}</div>
-          ) : (
-            <>
-              {/* ── Section 1: Activity breakdown ── */}
-              <div className="border-b border-slate-100">
-                <div className="px-5 py-2.5 bg-slate-50 flex items-center justify-between">
-                  <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">
-                    Активность по дням
-                  </span>
-                  {acts.length > 0 && (
-                    <span className="text-xs font-bold text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded-full">
-                      итого: {totalCount}
-                    </span>
+        {loading ? (
+          <div className="flex justify-center py-16"><Spinner /></div>
+        ) : fetchError ? (
+          <div className="px-6 py-8 text-center text-rose-500 text-sm">{fetchError}</div>
+        ) : (
+          <>
+            {/* Tab bar */}
+            <div className="flex overflow-x-auto border-b border-slate-100 flex-shrink-0 bg-slate-50/50">
+              {tabs.filter(t => t.show).map(t => (
+                <button
+                  key={t.key}
+                  onClick={() => setActiveTab(t.key)}
+                  className={`px-4 py-2.5 text-xs font-semibold whitespace-nowrap flex items-center gap-1.5 border-b-2 transition-colors ${
+                    activeTab === t.key
+                      ? 'border-indigo-600 text-indigo-700 bg-white'
+                      : 'border-transparent text-slate-500 hover:text-slate-700'
+                  }`}
+                >
+                  {t.label}
+                  {t.count > 0 && (
+                    <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-full tabular-nums ${
+                      activeTab === t.key ? 'bg-indigo-100 text-indigo-700' : 'bg-slate-200 text-slate-600'
+                    }`}>{t.count}</span>
+                  )}
+                </button>
+              ))}
+            </div>
+
+            {/* Scrollable body */}
+            <div className="flex-1 overflow-y-auto min-h-0">
+
+              {/* Activity tab */}
+              {activeTab === 'activity' && (
+                <div>
+                  {acts.length === 0 ? (
+                    <div className="px-5 py-10 text-center text-slate-400 text-xs">Нет активностей за выбранный период</div>
+                  ) : (
+                    <>
+                      <div className="px-5 py-2.5 bg-slate-50 flex items-center justify-between border-b border-slate-100">
+                        <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Активность по дням</span>
+                        <span className="text-xs font-bold text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded-full">итого: {totalActivityCount}</span>
+                      </div>
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="text-[11px] text-slate-500 font-semibold uppercase tracking-wide border-b border-slate-100">
+                            <th className="text-left px-5 py-2">Дата</th>
+                            <th className="text-left px-4 py-2">Бухгалтер</th>
+                            <th className="text-left px-4 py-2">Система</th>
+                            <th className="text-right px-5 py-2">Кол-во</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-50">
+                          {acts.map(a => (
+                            <tr key={a.id} className="hover:bg-indigo-50/20">
+                              <td className="px-5 py-2.5 text-xs font-semibold text-slate-700 whitespace-nowrap">{fmtDate(a.activity_date)}</td>
+                              <td className="px-4 py-2.5"><div className="flex items-center gap-1.5"><Avatar name={a.accountant_name} /><span className="text-xs text-slate-600">{a.accountant_name}</span></div></td>
+                              <td className="px-4 py-2.5"><SourcePill src={a.system_source} /></td>
+                              <td className="px-5 py-2.5 text-right"><span className="text-sm font-bold text-indigo-700 tabular-nums">{a[field] as number}</span></td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </>
                   )}
                 </div>
-                {acts.length === 0 ? (
-                  <div className="px-5 py-5 text-center text-slate-400 text-xs">Нет активностей за выбранный период</div>
-                ) : (
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-sm">
-                      <thead>
-                        <tr className="text-[11px] text-slate-500 font-semibold uppercase tracking-wide border-b border-slate-100">
-                          <th className="text-left px-5 py-2">Дата</th>
-                          <th className="text-left px-4 py-2">Бухгалтер</th>
-                          <th className="text-left px-4 py-2">Система</th>
-                          <th className="text-right px-5 py-2">Кол-во</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-50">
-                        {acts.map(a => (
-                          <tr key={a.id} className="hover:bg-indigo-50/20">
-                            <td className="px-5 py-2.5 text-xs font-semibold text-slate-700 whitespace-nowrap">{fmtDate(a.activity_date)}</td>
-                            <td className="px-4 py-2.5">
-                              <div className="flex items-center gap-1.5">
-                                <Avatar name={a.accountant_name} />
-                                <span className="text-xs text-slate-600">{a.accountant_name}</span>
-                              </div>
-                            </td>
-                            <td className="px-4 py-2.5"><SourcePill src={a.system_source} /></td>
-                            <td className="px-5 py-2.5 text-right">
-                              <span className="text-sm font-bold text-indigo-700 tabular-nums">{a[field] as number}</span>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-              </div>
+              )}
 
-              {/* ── Section 2: Attached documents ── */}
-              <div>
-                <div className="px-5 py-2.5 bg-slate-50 flex items-center justify-between">
-                  <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">
-                    Прикреплённые документы
-                  </span>
-                  {docs.length > 0 && (
-                    <span className="text-xs text-slate-400">{docs.length} шт.</span>
+              {/* ArmSoft Invoices tab */}
+              {activeTab === 'armsoft_invoices' && (
+                <div>
+                  {armsoftInvs.length === 0 ? (
+                    <div className="px-5 py-10 text-center text-slate-400 text-xs">Нет инвойсов в АрмСофт за выбранный период</div>
+                  ) : (
+                    <>
+                      <div className="px-5 py-2.5 bg-violet-50/60 flex items-center justify-between border-b border-violet-100">
+                        <span className="text-[11px] font-semibold text-violet-600 uppercase tracking-wide">Выставленные инвойсы (АрмСофт)</span>
+                        <span className="text-xs font-bold text-violet-700 bg-violet-100 px-2 py-0.5 rounded-full">{armsoftInvs.length} шт.</span>
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-sm">
+                          <thead>
+                            <tr className="text-[11px] text-slate-500 font-semibold uppercase tracking-wide border-b border-slate-100 bg-slate-50">
+                              <th className="text-left px-4 py-2 whitespace-nowrap">Дата</th>
+                              <th className="text-left px-4 py-2 whitespace-nowrap">№ Докум.</th>
+                              <th className="text-left px-4 py-2">Тип</th>
+                              <th className="text-left px-4 py-2">Контрагент</th>
+                              <th className="text-left px-4 py-2 whitespace-nowrap">ИНН контраг.</th>
+                              <th className="text-right px-4 py-2 whitespace-nowrap">Сумма</th>
+                              <th className="text-left px-4 py-2">Валюта</th>
+                              <th className="text-left px-4 py-2">Статус</th>
+                              <th className="text-left px-4 py-2">Е-Накл</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-50">
+                            {armsoftInvs.map((inv, i) => (
+                              <tr key={inv.id} className={`hover:bg-violet-50/20 ${i % 2 ? 'bg-slate-50/30' : ''}`}>
+                                <td className="px-4 py-2 text-xs text-slate-600 whitespace-nowrap">{inv.doc_date ? fmtDate(inv.doc_date.split('T')[0]) : '—'}</td>
+                                <td className="px-4 py-2 font-mono text-xs text-indigo-600 whitespace-nowrap">{inv.doc_num ?? '—'}</td>
+                                <td className="px-4 py-2 text-xs text-slate-600 max-w-[120px]"><span className="block truncate" title={inv.doc_type_name ?? undefined}>{inv.doc_type_name ?? '—'}</span></td>
+                                <td className="px-4 py-2 text-xs text-slate-700 max-w-[160px]"><span className="block truncate" title={inv.part_name ?? undefined}>{inv.part_name ?? '—'}</span></td>
+                                <td className="px-4 py-2 font-mono text-xs text-slate-500 whitespace-nowrap">{inv.part_tax_code ?? '—'}</td>
+                                <td className="px-4 py-2 text-right font-mono text-xs font-semibold text-slate-800 whitespace-nowrap">{fmtMoney(inv.summ)}</td>
+                                <td className="px-4 py-2 text-xs text-slate-500">{inv.curr_code ?? '—'}</td>
+                                <td className="px-4 py-2 whitespace-nowrap"><StatusBadge status={inv.doc_state_name} /></td>
+                                <td className="px-4 py-2 font-mono text-[10px] text-slate-400 whitespace-nowrap max-w-[120px]"><span className="block truncate">{inv.tax_invoice_serial_and_number ?? '—'}</span></td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </>
                   )}
                 </div>
+              )}
 
-                {docs.length === 0 && !showAddForm ? (
-                  <div className="px-5 py-5 text-center text-slate-400 text-xs">
-                    Документы не прикреплены — нажмите «Добавить документ»
+              {/* ArmSoft Documents tab */}
+              {activeTab === 'armsoft_docs' && (
+                <div>
+                  {armsoftDocs.length === 0 ? (
+                    <div className="px-5 py-10 text-center text-slate-400 text-xs">Нет документов в АрмСофт за выбранный период</div>
+                  ) : (
+                    <>
+                      <div className="px-5 py-2.5 bg-violet-50/60 flex items-center justify-between border-b border-violet-100">
+                        <span className="text-[11px] font-semibold text-violet-600 uppercase tracking-wide">Журнал документов (АрмСофт)</span>
+                        <span className="text-xs font-bold text-violet-700 bg-violet-100 px-2 py-0.5 rounded-full">{armsoftDocs.length} шт.</span>
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-sm">
+                          <thead>
+                            <tr className="text-[11px] text-slate-500 font-semibold uppercase tracking-wide border-b border-slate-100 bg-slate-50">
+                              <th className="text-left px-4 py-2 whitespace-nowrap">Дата</th>
+                              <th className="text-left px-4 py-2 whitespace-nowrap">№</th>
+                              <th className="text-left px-4 py-2">Тип документа</th>
+                              <th className="text-left px-4 py-2">Контрагент</th>
+                              <th className="text-right px-4 py-2">Сумма</th>
+                              <th className="text-left px-4 py-2">Сотрудник</th>
+                              <th className="text-left px-4 py-2">Статус</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-50">
+                            {armsoftDocs.map((doc, i) => (
+                              <tr key={doc.id} className={`hover:bg-violet-50/20 ${i % 2 ? 'bg-slate-50/30' : ''}`}>
+                                <td className="px-4 py-2 text-xs text-slate-600 whitespace-nowrap">{doc.doc_date ? fmtDate(doc.doc_date.split('T')[0]) : '—'}</td>
+                                <td className="px-4 py-2 font-mono text-xs text-indigo-600 whitespace-nowrap">{doc.doc_num ?? '—'}</td>
+                                <td className="px-4 py-2 text-xs text-slate-600 max-w-[140px]"><span className="block truncate" title={doc.doc_type_name ?? undefined}>{doc.doc_type_name ?? '—'}</span></td>
+                                <td className="px-4 py-2 text-xs text-slate-700 max-w-[150px]"><span className="block truncate" title={doc.part_name ?? undefined}>{doc.part_name ?? '—'}</span></td>
+                                <td className="px-4 py-2 text-right font-mono text-xs font-semibold text-slate-800">{fmtMoney(doc.summ)}</td>
+                                <td className="px-4 py-2 text-xs text-slate-500 whitespace-nowrap max-w-[120px]"><span className="block truncate">{doc.employee_name ?? '—'}</span></td>
+                                <td className="px-4 py-2 whitespace-nowrap"><StatusBadge status={doc.doc_state_name} /></td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+
+              {/* Tax Forms tab */}
+              {activeTab === 'tax_forms' && (
+                <div>
+                  {taxForms.length === 0 ? (
+                    <div className="px-5 py-10 text-center text-slate-400 text-xs">Нет налоговых форм за выбранный период</div>
+                  ) : (
+                    <>
+                      <div className="px-5 py-2.5 bg-emerald-50/60 flex items-center justify-between border-b border-emerald-100">
+                        <span className="text-[11px] font-semibold text-emerald-700 uppercase tracking-wide">Налоговые формы (ТаксСервис)</span>
+                        <span className="text-xs font-bold text-emerald-700 bg-emerald-100 px-2 py-0.5 rounded-full">{taxForms.length} шт.</span>
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-sm">
+                          <thead>
+                            <tr className="text-[11px] text-slate-500 font-semibold uppercase tracking-wide border-b border-slate-100 bg-slate-50">
+                              <th className="text-left px-4 py-2 whitespace-nowrap">Создано</th>
+                              <th className="text-left px-4 py-2 whitespace-nowrap">Изменено</th>
+                              <th className="text-left px-4 py-2">Название формы</th>
+                              <th className="text-left px-4 py-2 whitespace-nowrap">Период отчёта</th>
+                              <th className="text-left px-4 py-2">Логин</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-50">
+                            {taxForms.map((form, i) => (
+                              <tr key={form.id} className={`hover:bg-emerald-50/20 ${i % 2 ? 'bg-slate-50/30' : ''}`}>
+                                <td className="px-4 py-2 text-xs text-slate-600 whitespace-nowrap">{form.created_date ?? '—'}</td>
+                                <td className="px-4 py-2 text-xs text-slate-400 whitespace-nowrap">{form.modified_date || '—'}</td>
+                                <td className="px-4 py-2 text-xs text-slate-700 max-w-[300px]"><span className="block truncate" title={form.form_name ?? undefined}>{form.form_name ?? '—'}</span></td>
+                                <td className="px-4 py-2 text-xs font-medium text-emerald-700 whitespace-nowrap">{form.report_period ?? '—'}</td>
+                                <td className="px-4 py-2 font-mono text-[10px] text-slate-400">{form.username ?? '—'}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+
+              {/* Tax Invoices tab */}
+              {activeTab === 'tax_invoices' && (
+                <div>
+                  {taxInvs.length === 0 ? (
+                    <div className="px-5 py-10 text-center text-slate-400 text-xs">Нет налоговых инвойсов за выбранный период</div>
+                  ) : (
+                    <>
+                      <div className="px-5 py-2.5 bg-emerald-50/60 flex items-center justify-between border-b border-emerald-100">
+                        <span className="text-[11px] font-semibold text-emerald-700 uppercase tracking-wide">Выставленные инвойсы (ТаксСервис)</span>
+                        <span className="text-xs font-bold text-emerald-700 bg-emerald-100 px-2 py-0.5 rounded-full">{taxInvs.length} шт.</span>
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-sm">
+                          <thead>
+                            <tr className="text-[11px] text-slate-500 font-semibold uppercase tracking-wide border-b border-slate-100 bg-slate-50">
+                              <th className="text-left px-4 py-2 whitespace-nowrap">Дата выставления</th>
+                              <th className="text-left px-4 py-2 whitespace-nowrap">Серийный №</th>
+                              <th className="text-left px-4 py-2">Поставщик</th>
+                              <th className="text-left px-4 py-2">Покупатель</th>
+                              <th className="text-right px-4 py-2">Сумма</th>
+                              <th className="text-right px-4 py-2">НДС</th>
+                              <th className="text-left px-4 py-2">Тип</th>
+                              <th className="text-left px-4 py-2">Статус</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-50">
+                            {taxInvs.map((inv, i) => (
+                              <tr key={inv.id} className={`hover:bg-emerald-50/20 ${i % 2 ? 'bg-slate-50/30' : ''}`}>
+                                <td className="px-4 py-2 text-xs text-slate-600 whitespace-nowrap">{fmtDateTime(inv.issued_at)}</td>
+                                <td className="px-4 py-2 font-mono text-[10px] text-indigo-600 whitespace-nowrap">{inv.serial_no ?? '—'}</td>
+                                <td className="px-4 py-2 text-xs text-slate-700 max-w-[160px]"><span className="block truncate" title={inv.supplier_name ?? undefined}>{inv.supplier_name ?? '—'}</span></td>
+                                <td className="px-4 py-2 text-xs text-slate-700 max-w-[160px]"><span className="block truncate" title={inv.buyer_name ?? undefined}>{inv.buyer_name ?? '—'}</span></td>
+                                <td className="px-4 py-2 text-right font-mono text-xs font-semibold text-slate-800 whitespace-nowrap">{fmtMoney(inv.total)}</td>
+                                <td className="px-4 py-2 text-right font-mono text-xs text-slate-500 whitespace-nowrap">{fmtMoney(inv.total_vat_amount)}</td>
+                                <td className="px-4 py-2 text-xs text-slate-500 whitespace-nowrap">{inv.type ?? '—'}</td>
+                                <td className="px-4 py-2 whitespace-nowrap"><StatusBadge status={inv.approval_state} /></td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+
+              {/* Manual docs tab */}
+              {activeTab === 'manual_docs' && (
+                <div>
+                  <div className="px-5 py-2.5 bg-slate-50 flex items-center justify-between border-b border-slate-100">
+                    <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">Прикреплённые документы</span>
+                    {manualDocs.length > 0 && <span className="text-xs text-slate-400">{manualDocs.length} шт.</span>}
                   </div>
-                ) : docs.length > 0 && (
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-sm">
-                      <thead>
-                        <tr className="text-[11px] text-slate-500 font-semibold uppercase tracking-wide border-b border-slate-100">
-                          <th className="text-left px-4 py-2">#</th>
-                          <th className="text-left px-4 py-2 whitespace-nowrap">Дата</th>
-                          <th className="text-left px-4 py-2 whitespace-nowrap">№ документа</th>
-                          <th className="text-left px-4 py-2">Описание</th>
-                          <th className="text-right px-4 py-2 whitespace-nowrap">Сумма</th>
-                          <th className="text-left px-4 py-2">Период</th>
-                          <th className="text-left px-4 py-2">Заметки</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-50">
-                        {docs.map((doc, i) => (
-                          <tr key={doc.id} className={`hover:bg-indigo-50/20 ${i % 2 ? 'bg-slate-50/20' : ''}`}>
-                            <td className="px-4 py-2.5 text-slate-400 font-mono text-xs">{i + 1}</td>
-                            <td className="px-4 py-2.5 text-xs font-medium text-slate-700 whitespace-nowrap">{fmtDate(doc.document_date)}</td>
-                            <td className="px-4 py-2.5 font-mono text-xs text-indigo-600 whitespace-nowrap">{doc.document_number ?? '—'}</td>
-                            <td className="px-4 py-2.5 text-xs text-slate-700 max-w-[180px]">
-                              <span className="block truncate" title={doc.description ?? undefined}>{doc.description ?? '—'}</span>
-                            </td>
-                            <td className="px-4 py-2.5 text-right font-mono text-xs font-semibold text-slate-700 whitespace-nowrap">
-                              {doc.amount != null ? doc.amount.toLocaleString('ru-RU') : '—'}
-                            </td>
-                            <td className="px-4 py-2.5 text-xs text-slate-600 whitespace-nowrap">{doc.period ?? '—'}</td>
-                            <td className="px-4 py-2.5 text-xs text-slate-500 max-w-[150px]">
-                              <span className="block truncate" title={doc.notes ?? undefined}>{doc.notes ?? '—'}</span>
-                            </td>
+                  {manualDocs.length === 0 && !showAddForm ? (
+                    <div className="px-5 py-8 text-center text-slate-400 text-xs">Документы не прикреплены — нажмите «Добавить документ»</div>
+                  ) : manualDocs.length > 0 ? (
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-sm">
+                        <thead>
+                          <tr className="text-[11px] text-slate-500 font-semibold uppercase tracking-wide border-b border-slate-100">
+                            <th className="text-left px-4 py-2">#</th>
+                            <th className="text-left px-4 py-2 whitespace-nowrap">Дата</th>
+                            <th className="text-left px-4 py-2 whitespace-nowrap">№ документа</th>
+                            <th className="text-left px-4 py-2">Описание</th>
+                            <th className="text-right px-4 py-2 whitespace-nowrap">Сумма</th>
+                            <th className="text-left px-4 py-2">Период</th>
+                            <th className="text-left px-4 py-2">Заметки</th>
                           </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                )}
-
-                {showAddForm && (
-                  <div className="px-6 py-5 border-t border-slate-100 bg-slate-50/50">
-                    <h3 className="text-sm font-semibold text-slate-700 mb-4">Новый документ</h3>
-                    {saveError && <p className="text-sm text-red-600 bg-red-50 px-3 py-2 rounded-lg mb-3">{saveError}</p>}
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                      <label className="block">
-                        <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Дата *</span>
-                        <input type="date" value={addForm.document_date}
-                          onChange={e => setAddForm(f => ({ ...f, document_date: e.target.value }))}
-                          className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
-                      </label>
-                      <label className="block">
-                        <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">№ документа</span>
-                        <input type="text" placeholder="ИНВ-001"
-                          value={addForm.document_number}
-                          onChange={e => setAddForm(f => ({ ...f, document_number: e.target.value }))}
-                          className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
-                      </label>
-                      <label className="block sm:col-span-2">
-                        <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Описание</span>
-                        <input type="text" placeholder="Краткое описание документа"
-                          value={addForm.description}
-                          onChange={e => setAddForm(f => ({ ...f, description: e.target.value }))}
-                          className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
-                      </label>
-                      <label className="block">
-                        <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Сумма</span>
-                        <input type="number" placeholder="0"
-                          value={addForm.amount}
-                          onChange={e => setAddForm(f => ({ ...f, amount: e.target.value }))}
-                          className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
-                      </label>
-                      <label className="block">
-                        <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Период</span>
-                        <input type="text" placeholder="июнь 2026"
-                          value={addForm.period}
-                          onChange={e => setAddForm(f => ({ ...f, period: e.target.value }))}
-                          className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
-                      </label>
-                      <label className="block sm:col-span-2">
-                        <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Заметки</span>
-                        <textarea rows={2} placeholder="Дополнительная информация"
-                          value={addForm.notes}
-                          onChange={e => setAddForm(f => ({ ...f, notes: e.target.value }))}
-                          className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 resize-none" />
-                      </label>
+                        </thead>
+                        <tbody className="divide-y divide-slate-50">
+                          {manualDocs.map((doc, i) => (
+                            <tr key={doc.id} className={`hover:bg-indigo-50/20 ${i % 2 ? 'bg-slate-50/20' : ''}`}>
+                              <td className="px-4 py-2.5 text-slate-400 font-mono text-xs">{i + 1}</td>
+                              <td className="px-4 py-2.5 text-xs font-medium text-slate-700 whitespace-nowrap">{fmtDate(doc.document_date)}</td>
+                              <td className="px-4 py-2.5 font-mono text-xs text-indigo-600 whitespace-nowrap">{doc.document_number ?? '—'}</td>
+                              <td className="px-4 py-2.5 text-xs text-slate-700 max-w-[180px]"><span className="block truncate" title={doc.description ?? undefined}>{doc.description ?? '—'}</span></td>
+                              <td className="px-4 py-2.5 text-right font-mono text-xs font-semibold text-slate-700 whitespace-nowrap">{doc.amount != null ? doc.amount.toLocaleString('ru-RU') : '—'}</td>
+                              <td className="px-4 py-2.5 text-xs text-slate-600 whitespace-nowrap">{doc.period ?? '—'}</td>
+                              <td className="px-4 py-2.5 text-xs text-slate-500 max-w-[150px]"><span className="block truncate" title={doc.notes ?? undefined}>{doc.notes ?? '—'}</span></td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
                     </div>
-                    <div className="flex flex-wrap justify-between items-center mt-4 gap-2">
-                      <p className="text-xs text-slate-400">{params.company_name} · {DOC_TYPE_LABEL[params.document_type]} · {sysLabel}</p>
-                      <div className="flex gap-2">
-                        <button onClick={() => { setShowAddForm(false); setSaveError('') }}
-                          className="px-4 py-2 rounded-xl text-sm text-slate-600 hover:bg-slate-200 transition-colors">Отмена</button>
-                        <button onClick={handleSave} disabled={saving}
-                          className="px-5 py-2 rounded-xl text-sm font-semibold bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 transition-colors">
-                          {saving ? 'Сохранение…' : 'Сохранить'}
-                        </button>
+                  ) : null}
+
+                  {showAddForm && (
+                    <div className="px-6 py-5 border-t border-slate-100 bg-slate-50/50">
+                      <h3 className="text-sm font-semibold text-slate-700 mb-4">Новый документ</h3>
+                      {saveError && <p className="text-sm text-red-600 bg-red-50 px-3 py-2 rounded-lg mb-3">{saveError}</p>}
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <label className="block">
+                          <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Дата *</span>
+                          <input type="date" value={addForm.document_date}
+                            onChange={e => setAddForm(f => ({ ...f, document_date: e.target.value }))}
+                            className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                        </label>
+                        <label className="block">
+                          <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">№ документа</span>
+                          <input type="text" placeholder="ИНВ-001" value={addForm.document_number}
+                            onChange={e => setAddForm(f => ({ ...f, document_number: e.target.value }))}
+                            className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                        </label>
+                        <label className="block sm:col-span-2">
+                          <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Описание</span>
+                          <input type="text" placeholder="Краткое описание документа" value={addForm.description}
+                            onChange={e => setAddForm(f => ({ ...f, description: e.target.value }))}
+                            className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                        </label>
+                        <label className="block">
+                          <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Сумма</span>
+                          <input type="number" placeholder="0" value={addForm.amount}
+                            onChange={e => setAddForm(f => ({ ...f, amount: e.target.value }))}
+                            className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                        </label>
+                        <label className="block">
+                          <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Период</span>
+                          <input type="text" placeholder="июнь 2026" value={addForm.period}
+                            onChange={e => setAddForm(f => ({ ...f, period: e.target.value }))}
+                            className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                        </label>
+                        <label className="block sm:col-span-2">
+                          <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Заметки</span>
+                          <textarea rows={2} placeholder="Дополнительная информация" value={addForm.notes}
+                            onChange={e => setAddForm(f => ({ ...f, notes: e.target.value }))}
+                            className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 resize-none" />
+                        </label>
+                      </div>
+                      <div className="flex flex-wrap justify-between items-center mt-4 gap-2">
+                        <p className="text-xs text-slate-400">{params.company_name} · {DOC_TYPE_LABEL[params.document_type]} · {sysLabel}</p>
+                        <div className="flex gap-2">
+                          <button onClick={() => { setShowAddForm(false); setSaveError('') }}
+                            className="px-4 py-2 rounded-xl text-sm text-slate-600 hover:bg-slate-200 transition-colors">Отмена</button>
+                          <button onClick={handleSave} disabled={saving}
+                            className="px-5 py-2 rounded-xl text-sm font-semibold bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 transition-colors">
+                            {saving ? 'Сохранение…' : 'Сохранить'}
+                          </button>
+                        </div>
                       </div>
                     </div>
-                  </div>
-                )}
-              </div>
-            </>
-          )}
-        </div>
+                  )}
+                </div>
+              )}
+            </div>
 
-        {/* Footer */}
-        <div className="px-6 py-3.5 border-t border-slate-100 flex-shrink-0 flex justify-between items-center bg-slate-50/30">
-          <span className="text-xs text-slate-400">
-            {loading ? '…' : `${acts.length} ${acts.length === 1 ? 'запись' : acts.length < 5 ? 'записи' : 'записей'} активности · ${docs.length} документов`}
-          </span>
-          {!showAddForm && !loading && (
-            <button onClick={() => setShowAddForm(true)}
-              className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-indigo-600 text-white text-xs font-semibold hover:bg-indigo-700 transition-colors shadow-sm">
-              + Добавить документ
-            </button>
-          )}
-        </div>
+            {/* Footer */}
+            <div className="px-6 py-3.5 border-t border-slate-100 flex-shrink-0 flex justify-between items-center bg-slate-50/30">
+              <span className="text-xs text-slate-400">
+                {`АрмСофт: ${armsoftInvs.length} инвойс. / ${armsoftDocs.length} докум. · ТаксСервис: ${taxForms.length} форм / ${taxInvs.length} инвойс. · Вручную: ${manualDocs.length}`}
+              </span>
+              {activeTab === 'manual_docs' && !showAddForm && (
+                <button onClick={() => setShowAddForm(true)}
+                  className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-indigo-600 text-white text-xs font-semibold hover:bg-indigo-700 transition-colors shadow-sm">
+                  + Добавить документ
+                </button>
+              )}
+            </div>
+          </>
+        )}
       </div>
     </div>
   )
@@ -542,17 +802,14 @@ function AddCommentModal({ employees, companies, onSave, onClose }: {
 type Tab = 'companies' | 'missing' | 'comments'
 
 export default function Dashboard() {
-  // ── Static data (loaded once) ──────────────────────────────────────────────
   const [employees,      setEmployees]  = useState<Employee[]>([])
   const [companies,      setCompanies]  = useState<AccountingCompany[]>([])
   const [artemCompanies, setArtemComp]  = useState<ArtemCompany[]>([])
 
-  // ── Dynamic data (reloaded on filter change) ───────────────────────────────
   const [activities, setActivities] = useState<Activity[]>([])
   const [comments,   setComments]   = useState<DailyComment[]>([])
 
-  // ── UI state ───────────────────────────────────────────────────────────────
-  const [dateFrom,    setDateFrom]      = useState(nDaysAgo(6))
+  const [dateFrom,    setDateFrom]      = useState(nDaysAgo(29))
   const [dateTo,      setDateTo]        = useState(today())
   const [accountant,  setAccountant]    = useState('all')
   const [company,     setCompanyFilter] = useState('all')
@@ -564,7 +821,6 @@ export default function Dashboard() {
   const [loadingStatic,  setLoadingStatic]  = useState(true)
   const [loadingDynamic, setLoadingDynamic] = useState(false)
 
-  // ── Load static data once ──────────────────────────────────────────────────
   useEffect(() => {
     Promise.all([
       fetch('/api/employees').then(r => r.json()),
@@ -577,7 +833,6 @@ export default function Dashboard() {
     }).finally(() => setLoadingStatic(false))
   }, [])
 
-  // ── Load dynamic data when filters change ──────────────────────────────────
   const loadDynamic = useCallback(() => {
     setLoadingDynamic(true)
     const ap = new URLSearchParams({ from: dateFrom, to: dateTo, accountant, company, source })
@@ -593,11 +848,17 @@ export default function Dashboard() {
 
   useEffect(() => { loadDynamic() }, [loadDynamic])
 
-  // ── Aggregate: ALL accounting companies + activity overlay ─────────────────
+  // ── company lookup map for armsoft/tax ids ─────────────────────────────────
+  const companyIdMap = useMemo(() => {
+    const m = new Map<string, AccountingCompany>()
+    for (const c of companies) m.set(c.company_name, c)
+    return m
+  }, [companies])
+
+  // ── Aggregate company rows ─────────────────────────────────────────────────
   const companyRows = useMemo<CompanyRow[]>(() => {
     const map = new Map<string, CompanyRow>()
 
-    // Pre-populate with every accounting company matching current filters
     for (const c of companies) {
       if (accountant !== 'all' && c.accountant_name !== accountant) continue
       if (company !== 'all' && c.company_name !== company) continue
@@ -611,7 +872,6 @@ export default function Dashboard() {
       })
     }
 
-    // Overlay activity data (already server-filtered by accountant/company/source/dates)
     for (const a of activities) {
       let row = map.get(a.company_name)
       if (!row) {
@@ -637,22 +897,31 @@ export default function Dashboard() {
       row.total.balance      += a.balance_changes
     }
 
-    return Array.from(map.values()).sort((a, b) => a.company_name.localeCompare(b.company_name, 'ru'))
+    return Array.from(map.values()).sort((a, b) => {
+      const aHas = a.total.invoices + a.total.reports + a.total.applications + a.total.balance
+      const bHas = b.total.invoices + b.total.reports + b.total.applications + b.total.balance
+      if (aHas !== bHas) return bHas - aHas
+      return a.company_name.localeCompare(b.company_name, 'ru')
+    })
   }, [activities, companies, accountant, company])
 
-  // ── Global KPI totals ──────────────────────────────────────────────────────
   const kpi = useMemo(() => companyRows.reduce(
     (acc, r) => ({ invoices: acc.invoices + r.total.invoices, reports: acc.reports + r.total.reports, applications: acc.applications + r.total.applications, balance: acc.balance + r.total.balance }),
     emptyTotals()
   ), [companyRows])
 
-  // ── Missing companies ──────────────────────────────────────────────────────
   const missingCompanies = useMemo(() => {
     const ourNames = new Set(companies.map(c => c.company_name.trim().toLowerCase()))
     return artemCompanies.filter(c => !ourNames.has(c.company_name.trim().toLowerCase()))
   }, [companies, artemCompanies])
 
-  // ── Add comment ────────────────────────────────────────────────────────────
+  // ── Unique accountant list from real data ──────────────────────────────────
+  const accountantList = useMemo(() => {
+    const s = new Set<string>()
+    for (const c of companies) if (c.accountant_name) s.add(c.accountant_name)
+    return Array.from(s).sort()
+  }, [companies])
+
   const handleAddComment = async (form: CommentForm) => {
     const res = await fetch('/api/comments', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(form),
@@ -662,28 +931,21 @@ export default function Dashboard() {
     loadDynamic()
   }
 
-  // ── Date presets ───────────────────────────────────────────────────────────
   const setPreset = (p: string) => {
     const t = today()
-    if (p === 'today') { setDateFrom(t); setDateTo(t) }
-    else if (p === 'week') { setDateFrom(nDaysAgo(6)); setDateTo(t) }
-    else { setDateFrom(nDaysAgo(29)); setDateTo(t) }
+    if (p === 'today')  { setDateFrom(t);         setDateTo(t) }
+    else if (p === 'week')  { setDateFrom(nDaysAgo(6));  setDateTo(t) }
+    else                    { setDateFrom(nDaysAgo(29)); setDateTo(t) }
   }
 
   const loading = loadingStatic || loadingDynamic
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Render
-  // ─────────────────────────────────────────────────────────────────────────
-
   return (
     <div className="min-h-screen bg-slate-50">
 
-      {/* ── Header ────────────────────────────────────────────────────────── */}
       <header className="bg-white border-b border-slate-200 sticky top-0 z-30 shadow-sm">
         <div className="max-w-screen-2xl mx-auto px-4 sm:px-6 py-3">
           <div className="flex flex-wrap items-center gap-4 justify-between">
-
             <div className="flex items-center gap-3 flex-shrink-0">
               <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-500 to-indigo-700 flex items-center justify-center text-white font-bold text-sm shadow">
                 OB
@@ -698,7 +960,7 @@ export default function Dashboard() {
               <select value={accountant} onChange={e => setAccountant(e.target.value)}
                 className="border border-slate-200 rounded-xl px-3 py-2 text-xs bg-white focus:outline-none focus:ring-2 focus:ring-indigo-400">
                 <option value="all">Все бухгалтеры</option>
-                {employees.map(e => <option key={e.id} value={e.full_name}>{e.full_name}</option>)}
+                {accountantList.map(a => <option key={a} value={a}>{a}</option>)}
               </select>
 
               <select value={company} onChange={e => setCompanyFilter(e.target.value)}
@@ -740,21 +1002,19 @@ export default function Dashboard() {
 
       <main className="max-w-screen-2xl mx-auto px-4 sm:px-6 py-6 space-y-6">
 
-        {/* ── KPI Cards ──────────────────────────────────────────────────── */}
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
-          <KpiCard label="Выписано инвойсов"  value={kpi.invoices}     icon="🧾" accent="bg-emerald-50 text-emerald-600"
+          <KpiCard label="Выписано инвойсов"  value={kpi.invoices.toLocaleString('ru-RU')}     icon="🧾" accent="bg-emerald-50 text-emerald-600"
             sub={source !== 'all' ? SRC_LABEL[source] : 'все системы'} />
-          <KpiCard label="Сдано отчётности"   value={kpi.reports}      icon="📋" accent="bg-violet-50 text-violet-600"
+          <KpiCard label="Сдано отчётности"   value={kpi.reports.toLocaleString('ru-RU')}      icon="📋" accent="bg-violet-50 text-violet-600"
             sub={source !== 'all' ? SRC_LABEL[source] : 'все системы'} />
-          <KpiCard label="Подано заявлений"   value={kpi.applications} icon="📝" accent="bg-amber-50 text-amber-600"
+          <KpiCard label="Подано заявлений"   value={kpi.applications.toLocaleString('ru-RU')} icon="📝" accent="bg-amber-50 text-amber-600"
             sub={source !== 'all' ? SRC_LABEL[source] : 'все системы'} />
-          <KpiCard label="Изменений остатков" value={kpi.balance}      icon="⚖️" accent="bg-rose-50 text-rose-600"
+          <KpiCard label="Изменений остатков" value={kpi.balance.toLocaleString('ru-RU')}      icon="⚖️" accent="bg-rose-50 text-rose-600"
             sub={source !== 'all' ? SRC_LABEL[source] : 'все системы'} />
           <KpiCard label="Нет в бухгалтерии"  value={missingCompanies.length} icon="⚠️" accent="bg-orange-50 text-orange-500"
             sub={`у Артема ${artemCompanies.length} · у нас ${companies.length}`} />
         </div>
 
-        {/* ── Tabs ───────────────────────────────────────────────────────── */}
         <div className="border-b border-slate-200 flex gap-0">
           {([
             ['companies', `По компаниям (${companyRows.length})`],
@@ -771,9 +1031,7 @@ export default function Dashboard() {
           ))}
         </div>
 
-        {/* ═══════════════════════════════════════════════════════════════════ */}
-        {/* TAB 1 — Companies                                                   */}
-        {/* ═══════════════════════════════════════════════════════════════════ */}
+        {/* TAB 1 — Companies */}
         {activeTab === 'companies' && (
           <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
             <div className="px-5 py-3.5 border-b border-slate-100 flex items-center justify-between flex-wrap gap-2">
@@ -784,14 +1042,14 @@ export default function Dashboard() {
               </h2>
               <div className="flex gap-1.5 items-center">
                 <SourcePill src="base" /><SourcePill src="armsoft" /><SourcePill src="taxservice" />
-                <span className="text-xs text-slate-400 ml-2">Нажмите на число, чтобы увидеть документы</span>
+                <span className="text-xs text-slate-400 ml-2">Нажмите на число → увидите документы</span>
               </div>
             </div>
 
             {companyRows.length === 0 && !loading ? (
               <div className="text-center py-20 text-slate-400">
                 <p className="text-4xl mb-3">📭</p>
-                <p className="text-sm font-medium">Нет данных за выбранный период и фильтры</p>
+                <p className="text-sm font-medium">Нет данных за выбранный период</p>
               </div>
             ) : (
               <div className="overflow-x-auto">
@@ -815,44 +1073,44 @@ export default function Dashboard() {
                       <th colSpan={2} />
                       {source === 'all' || source === 'base' ? (
                         <th className="py-1 bg-blue-50/40 border-x border-blue-100">
-                          <div className="grid grid-cols-4 gap-x-3 text-center px-4 min-w-[130px]">
-                            <span>Инв</span><span>Отч</span><span>Зая</span><span>Ост</span>
-                          </div>
+                          <div className="grid grid-cols-4 gap-x-3 text-center px-4 min-w-[130px]"><span>Инв</span><span>Отч</span><span>Зая</span><span>Ост</span></div>
                         </th>
                       ) : null}
                       {source === 'all' || source === 'armsoft' ? (
                         <th className="py-1 bg-violet-50/40 border-x border-violet-100">
-                          <div className="grid grid-cols-4 gap-x-3 text-center px-4 min-w-[130px]">
-                            <span>Инв</span><span>Отч</span><span>Зая</span><span>Ост</span>
-                          </div>
+                          <div className="grid grid-cols-4 gap-x-3 text-center px-4 min-w-[130px]"><span>Инв</span><span>Отч</span><span>Зая</span><span>Ост</span></div>
                         </th>
                       ) : null}
                       {source === 'all' || source === 'taxservice' ? (
                         <th className="py-1 bg-emerald-50/40 border-x border-emerald-100">
-                          <div className="grid grid-cols-4 gap-x-3 text-center px-4 min-w-[130px]">
-                            <span>Инв</span><span>Отч</span><span>Зая</span><span>Ост</span>
-                          </div>
+                          <div className="grid grid-cols-4 gap-x-3 text-center px-4 min-w-[130px]"><span>Инв</span><span>Отч</span><span>Зая</span><span>Ост</span></div>
                         </th>
                       ) : null}
                       <th className="py-1">
-                        <div className="grid grid-cols-4 gap-x-3 text-center px-4 min-w-[130px]">
-                          <span>Инв</span><span>Отч</span><span>Зая</span><span>Ост</span>
-                        </div>
+                        <div className="grid grid-cols-4 gap-x-3 text-center px-4 min-w-[130px]"><span>Инв</span><span>Отч</span><span>Зая</span><span>Ост</span></div>
                       </th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
                     {companyRows.map((row, i) => {
+                      const comp = companyIdMap.get(row.company_name)
                       const ctx = (sys: string): MetricContext => ({
                         company_name: row.company_name,
                         accountant_name: row.accountant_name,
                         system_source: sys,
                         date_from: dateFrom,
                         date_to: dateTo,
+                        armsoft_company_id: comp?.armsoft_company_id ?? null,
+                        tax_account_id: comp?.tax_account_id ?? null,
                       })
                       return (
                         <tr key={row.company_name} className={`hover:bg-indigo-50/30 transition-colors ${i % 2 ? 'bg-slate-50/30' : ''}`}>
-                          <td className="px-5 py-3 font-medium text-slate-800 whitespace-nowrap">{row.company_name}</td>
+                          <td className="px-5 py-3 font-medium text-slate-800 whitespace-nowrap max-w-[220px]">
+                            <span className="block truncate" title={row.company_name}>{row.company_name}</span>
+                            {comp?.armsoft_company_id && (
+                              <span className="text-[9px] text-violet-400 font-mono">AS:{comp.armsoft_company_id}</span>
+                            )}
+                          </td>
                           <td className="px-4 py-3 whitespace-nowrap">
                             <div className="flex items-center gap-2">
                               <Avatar name={row.accountant_name} />
@@ -895,10 +1153,10 @@ export default function Dashboard() {
                         {source === 'all' || source === 'taxservice'  ? <td className="px-4 py-3 bg-emerald-50/50 border-x border-emerald-100" /> : null}
                         <td className="px-4 py-3">
                           <div className="grid grid-cols-4 gap-x-3 text-right min-w-[130px]">
-                            <span className="text-indigo-700 tabular-nums">{kpi.invoices}</span>
-                            <span className="text-violet-700 tabular-nums">{kpi.reports}</span>
-                            <span className="text-amber-700 tabular-nums">{kpi.applications}</span>
-                            <span className="text-rose-700 tabular-nums">{kpi.balance}</span>
+                            <span className="text-indigo-700 tabular-nums">{kpi.invoices.toLocaleString('ru-RU')}</span>
+                            <span className="text-violet-700 tabular-nums">{kpi.reports.toLocaleString('ru-RU')}</span>
+                            <span className="text-amber-700 tabular-nums">{kpi.applications.toLocaleString('ru-RU')}</span>
+                            <span className="text-rose-700 tabular-nums">{kpi.balance.toLocaleString('ru-RU')}</span>
                           </div>
                         </td>
                       </tr>
@@ -910,9 +1168,7 @@ export default function Dashboard() {
           </div>
         )}
 
-        {/* ═══════════════════════════════════════════════════════════════════ */}
-        {/* TAB 2 — Missing companies                                           */}
-        {/* ═══════════════════════════════════════════════════════════════════ */}
+        {/* TAB 2 — Missing companies */}
         {activeTab === 'missing' && (
           <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
             <div className="px-5 py-3.5 border-b border-slate-100 flex items-center justify-between">
@@ -924,7 +1180,6 @@ export default function Dashboard() {
               </div>
               <span className="text-3xl font-bold text-rose-500">{missingCompanies.length}</span>
             </div>
-
             {missingCompanies.length === 0 ? (
               <div className="text-center py-20 text-slate-400">
                 <p className="text-4xl mb-3">✅</p>
@@ -951,9 +1206,7 @@ export default function Dashboard() {
                           <td className="px-4 py-3 font-mono text-xs text-slate-500">{c.contract_number ?? '—'}</td>
                           <td className="px-4 py-3 font-mono text-xs text-slate-500">{c.tin ?? '—'}</td>
                           <td className="px-4 py-3">
-                            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-rose-100 text-rose-700">
-                              ⚠️ Не добавлена
-                            </span>
+                            <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-rose-100 text-rose-700">⚠️ Не добавлена</span>
                           </td>
                         </tr>
                       ))}
@@ -979,9 +1232,7 @@ export default function Dashboard() {
           </div>
         )}
 
-        {/* ═══════════════════════════════════════════════════════════════════ */}
-        {/* TAB 3 — Daily comments                                              */}
-        {/* ═══════════════════════════════════════════════════════════════════ */}
+        {/* TAB 3 — Comments */}
         {activeTab === 'comments' && (
           <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
             <div className="px-5 py-3.5 border-b border-slate-100 flex items-center justify-between flex-wrap gap-3">
@@ -994,7 +1245,6 @@ export default function Dashboard() {
                 + Добавить комментарий
               </button>
             </div>
-
             {comments.length === 0 ? (
               <div className="text-center py-20 text-slate-400">
                 <p className="text-4xl mb-3">💬</p>
@@ -1009,17 +1259,13 @@ export default function Dashboard() {
                 {comments.map(c => (
                   <div key={c.id} className="px-5 py-4 hover:bg-slate-50/50 transition-colors">
                     <div className="flex flex-wrap items-center gap-2 mb-2">
-                      <span className="text-xs font-semibold bg-slate-100 text-slate-600 px-2 py-0.5 rounded-lg">
-                        {fmtDate(c.comment_date)}
-                      </span>
+                      <span className="text-xs font-semibold bg-slate-100 text-slate-600 px-2 py-0.5 rounded-lg">{fmtDate(c.comment_date)}</span>
                       <div className="flex items-center gap-1.5">
                         <Avatar name={c.accountant_name} />
                         <span className="text-sm font-semibold text-slate-700">{c.accountant_name}</span>
                       </div>
                       {c.company_name && (
-                        <span className="text-xs bg-blue-50 text-blue-700 px-2 py-0.5 rounded-lg font-medium">
-                          {c.company_name}
-                        </span>
+                        <span className="text-xs bg-blue-50 text-blue-700 px-2 py-0.5 rounded-lg font-medium">{c.company_name}</span>
                       )}
                     </div>
                     <p className="text-sm text-slate-800 leading-relaxed">{c.comment}</p>
@@ -1040,7 +1286,7 @@ export default function Dashboard() {
         )}
 
         <footer className="text-center text-xs text-slate-400 pb-4">
-          OB Accounting Dashboard · OB Artyom + OB FAQ Supabase · Обновлено при изменении фильтров
+          OB Accounting Dashboard · {companies.length} компаний · АрмСофт + ТаксСервис · Данные из armsoft_db
         </footer>
       </main>
 
