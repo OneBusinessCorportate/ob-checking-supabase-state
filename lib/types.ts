@@ -12,6 +12,8 @@ export type AccountingCompany = {
   contract_number: string | null
   accountant_name: string | null
   is_active: boolean
+  armsoft_company_id: number | null
+  tax_account_id: number | null
 }
 
 export type ArtemCompany = {
@@ -59,6 +61,64 @@ export type CompanyRow = {
   armsoft: SystemTotals
   taxservice: SystemTotals
   total: SystemTotals
+}
+
+export type ArmSoftInvoice = {
+  id: number
+  company_id: number
+  doc_date: string | null
+  doc_num: string | null
+  doc_type_name: string | null
+  curr_code: string | null
+  summ: number | null
+  part_name: string | null
+  part_tax_code: string | null
+  tax_invoice_serial_and_number: string | null
+  doc_state_name: string | null
+  creator: string | null
+}
+
+export type ArmSoftDocument = {
+  id: number
+  company_id: number
+  doc_date: string | null
+  doc_num: string | null
+  doc_type_name: string | null
+  curr_code: string | null
+  summ: number | null
+  part_name: string | null
+  part_tax_code: string | null
+  employee_name: string | null
+  doc_state_name: string | null
+  creator: string | null
+  comment: string | null
+}
+
+export type TaxForm = {
+  id: number
+  company_id: number
+  username: string | null
+  form_name: string | null
+  created_date: string | null
+  modified_date: string | null
+  report_period: string | null
+  scraped_at: string | null
+}
+
+export type TaxServiceInvoice = {
+  id: number
+  company_id: number
+  username: string | null
+  tin: string | null
+  serial_no: string | null
+  type: string | null
+  approval_state: string | null
+  status: string | null
+  issued_at: string | null
+  supplier_name: string | null
+  buyer_name: string | null
+  total: string | null
+  total_vat_amount: string | null
 }
 
 export type DocumentRecord = {

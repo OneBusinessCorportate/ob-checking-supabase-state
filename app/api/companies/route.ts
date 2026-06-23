@@ -6,7 +6,7 @@ export async function GET() {
     const supabase = getArtyomClient()
     const { data, error } = await supabase
       .from('ob_accounting_companies')
-      .select('id, company_name, contract_number, accountant_name, is_active')
+      .select('id, company_name, contract_number, accountant_name, is_active, armsoft_company_id, tax_account_id')
       .order('company_name')
 
     if (error) return NextResponse.json({ error: error.message }, { status: 500 })
