@@ -60,3 +60,19 @@ export type CompanyRow = {
   taxservice: SystemTotals
   total: SystemTotals
 }
+
+export type DocumentRecord = {
+  id: number
+  company_id: number | null
+  company_name: string
+  accountant_name: string
+  document_date: string
+  document_type: 'invoice' | 'report' | 'application' | 'balance_change'
+  system_source: 'base' | 'armsoft' | 'taxservice'
+  document_number: string | null
+  description: string | null
+  amount: number | null
+  period: string | null
+  notes: string | null
+  created_at: string
+}

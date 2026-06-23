@@ -1,20 +1,61 @@
 'use client'
 
 import { useState, useEffect, useMemo, useCallback } from 'react'
-import type { Activity, AccountingCompany, ArtemCompany, DailyComment, Employee, CompanyRow, SystemTotals } from '@/lib/types'
+import type {
+  Activity, AccountingCompany, ArtemCompany, DailyComment,
+  Employee, CompanyRow, SystemTotals, DocumentRecord,
+} from '@/lib/types'
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Local types ──────────────────────────────────────────────────────────────
+
+type DocType = 'invoice' | 'report' | 'application' | 'balance_change'
+
+type CellClickParams = {
+  company_name: string
+  accountant_name: string
+  system_source: string
+  document_type: DocType
+  date_from: string
+  date_to: string
+}
+
+type MetricContext = {
+  company_name: string
+  accountant_name: string
+  system_source: string
+  date_from: string
+  date_to: string
+}
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const DOC_TYPE_LABEL: Record<DocType, string> = {
+  invoice: 'Инвойсы',
+  report: 'Отчётность',
+  application: 'Заявления',
+  balance_change: 'Изменения остатков',
+}
+
+const DOC_TYPE_ICON: Record<DocType, string> = {
+  invoice: '🧾',
+  report: '📋',
+  application: '📝',
+  balance_change: '⚖️',
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function today() { return new Date().toISOString().split('T')[0] }
 function nDaysAgo(n: number) {
   const d = new Date(); d.setDate(d.getDate() - n); return d.toISOString().split('T')[0]
 }
 function fmtDate(iso: string) {
+  if (!iso) return '—'
   const [y, m, d] = iso.split('-'); return `${d}.${m}.${y}`
 }
 function emptyTotals(): SystemTotals { return { invoices: 0, reports: 0, applications: 0, balance: 0 } }
 
-// ─── UI atoms ────────────────────────────────────────────────────────────────
+// ─── UI atoms ─────────────────────────────────────────────────────────────────
 
 function Spinner() {
   return <div className="w-4 h-4 border-2 border-indigo-500 border-t-transparent rounded-full animate-spin" />
@@ -24,7 +65,7 @@ function KpiCard({ label, value, sub, icon, accent }: {
   label: string; value: number | string; sub?: string; icon: string; accent: string
 }) {
   return (
-    <div className={`bg-white rounded-2xl border border-slate-200 shadow-sm p-5 flex gap-4 items-center`}>
+    <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-5 flex gap-4 items-center">
       <div className={`w-11 h-11 rounded-xl flex items-center justify-center text-xl flex-shrink-0 ${accent}`}>
         {icon}
       </div>
@@ -45,6 +86,9 @@ const SRC_PILL: Record<string, string> = {
 }
 
 function SourcePill({ src }: { src: string }) {
+  if (src === 'all') {
+    return <span className="inline-block px-2 py-0.5 rounded-full text-[11px] font-semibold bg-slate-100 text-slate-600">Все системы</span>
+  }
   return (
     <span className={`inline-block px-2 py-0.5 rounded-full text-[11px] font-semibold ${SRC_PILL[src] ?? 'bg-slate-100 text-slate-500'}`}>
       {SRC_LABEL[src] ?? src}
@@ -61,24 +105,290 @@ function Avatar({ name }: { name: string }) {
   )
 }
 
-function MetricGrid({ t, dim }: { t: SystemTotals; dim?: boolean }) {
+function MetricGrid({ t, dim, context, onCellClick }: {
+  t: SystemTotals
+  dim?: boolean
+  context?: MetricContext
+  onCellClick?: (p: CellClickParams) => void
+}) {
   const empty = t.invoices === 0 && t.reports === 0 && t.applications === 0 && t.balance === 0
   if (empty) return <span className="text-slate-300 text-sm select-none">—</span>
+
+  const cell = (count: number, doc_type: DocType) => {
+    if (context && onCellClick && count > 0) {
+      return (
+        <button
+          onClick={() => onCellClick({ ...context, document_type: doc_type })}
+          className="font-semibold text-indigo-700 hover:text-indigo-900 hover:underline cursor-pointer tabular-nums leading-none"
+        >
+          {count}
+        </button>
+      )
+    }
+    return <span className={`font-semibold tabular-nums ${count === 0 ? 'text-slate-300' : 'text-slate-800'}`}>{count}</span>
+  }
+
   return (
     <div className={`grid grid-cols-4 gap-x-3 text-xs text-right min-w-[130px] ${dim ? 'opacity-50' : ''}`}>
       <span className="text-slate-400 font-medium">Инв</span>
       <span className="text-slate-400 font-medium">Отч</span>
       <span className="text-slate-400 font-medium">Зая</span>
       <span className="text-slate-400 font-medium">Ост</span>
-      <span className="font-semibold text-slate-800">{t.invoices}</span>
-      <span className="font-semibold text-slate-800">{t.reports}</span>
-      <span className="font-semibold text-slate-800">{t.applications}</span>
-      <span className="font-semibold text-slate-800">{t.balance}</span>
+      {cell(t.invoices, 'invoice')}
+      {cell(t.reports, 'report')}
+      {cell(t.applications, 'application')}
+      {cell(t.balance, 'balance_change')}
     </div>
   )
 }
 
-// ─── Add Comment Modal ────────────────────────────────────────────────────────
+// ─── Document Detail Modal ─────────────────────────────────────────────────────
+
+function DocumentDetailModal({ params, onClose }: { params: CellClickParams; onClose: () => void }) {
+  const [docs, setDocs] = useState<DocumentRecord[]>([])
+  const [loading, setLoading] = useState(true)
+  const [fetchError, setFetchError] = useState('')
+  const [showAddForm, setShowAddForm] = useState(false)
+  const [addForm, setAddForm] = useState({
+    document_number: '',
+    document_date: today(),
+    description: '',
+    amount: '',
+    period: '',
+    notes: '',
+  })
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState('')
+
+  const fetchDocs = useCallback(async () => {
+    setLoading(true); setFetchError('')
+    try {
+      const p = new URLSearchParams({
+        company_name: params.company_name,
+        document_type: params.document_type,
+        from: params.date_from,
+        to: params.date_to,
+      })
+      if (params.system_source && params.system_source !== 'all') p.set('system_source', params.system_source)
+      if (params.accountant_name && params.accountant_name !== '—') p.set('accountant_name', params.accountant_name)
+      const res = await fetch(`/api/documents?${p}`)
+      const data = await res.json()
+      if (!res.ok) { setFetchError(data.error ?? 'Ошибка загрузки'); return }
+      setDocs(Array.isArray(data) ? data : [])
+    } catch (e) {
+      setFetchError(String(e))
+    } finally {
+      setLoading(false)
+    }
+  }, [params])
+
+  useEffect(() => { fetchDocs() }, [fetchDocs])
+
+  const handleSave = async () => {
+    setSaving(true); setSaveError('')
+    try {
+      const body = {
+        company_name: params.company_name,
+        accountant_name: params.accountant_name !== '—' ? params.accountant_name : null,
+        document_type: params.document_type,
+        system_source: params.system_source !== 'all' ? params.system_source : 'base',
+        document_number: addForm.document_number || null,
+        document_date: addForm.document_date,
+        description: addForm.description || null,
+        amount: addForm.amount ? parseFloat(addForm.amount) : null,
+        period: addForm.period || null,
+        notes: addForm.notes || null,
+      }
+      const res = await fetch('/api/documents', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      if (!res.ok) { const e = await res.json(); throw new Error(e.error ?? 'Ошибка') }
+      setShowAddForm(false)
+      setAddForm({ document_number: '', document_date: today(), description: '', amount: '', period: '', notes: '' })
+      fetchDocs()
+    } catch (e) {
+      setSaveError(String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const sysLabel = params.system_source !== 'all' ? (SRC_LABEL[params.system_source] ?? params.system_source) : 'Все системы'
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
+      <div
+        className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[88vh] flex flex-col"
+        onClick={e => e.stopPropagation()}
+      >
+        {/* Header */}
+        <div className="px-6 py-4 border-b border-slate-100 flex-shrink-0">
+          <div className="flex items-start justify-between gap-4">
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2 mb-1.5">
+                <span className="text-xl">{DOC_TYPE_ICON[params.document_type]}</span>
+                <h2 className="font-bold text-slate-900 text-lg leading-tight">{DOC_TYPE_LABEL[params.document_type]}</h2>
+                <span className="text-slate-300 font-light text-lg">·</span>
+                <span className="font-semibold text-slate-700 text-lg leading-tight truncate max-w-[260px]">{params.company_name}</span>
+              </div>
+              <div className="flex flex-wrap gap-2 items-center">
+                <SourcePill src={params.system_source} />
+                <span className="text-xs text-slate-400">{fmtDate(params.date_from)} — {fmtDate(params.date_to)}</span>
+                {params.accountant_name && params.accountant_name !== '—' && (
+                  <div className="flex items-center gap-1.5">
+                    <Avatar name={params.accountant_name} />
+                    <span className="text-xs text-slate-600">{params.accountant_name}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+            <button onClick={onClose} className="text-slate-400 hover:text-slate-600 text-2xl leading-none flex-shrink-0 mt-0.5">×</button>
+          </div>
+        </div>
+
+        {/* Scrollable body */}
+        <div className="flex-1 overflow-y-auto min-h-0">
+          {loading ? (
+            <div className="flex justify-center py-16"><Spinner /></div>
+          ) : fetchError ? (
+            <div className="px-6 py-8 text-center text-rose-500 text-sm">{fetchError}</div>
+          ) : (
+            <>
+              {docs.length === 0 && !showAddForm && (
+                <div className="text-center py-16 text-slate-400">
+                  <p className="text-5xl mb-3">📄</p>
+                  <p className="text-sm font-medium text-slate-600">Документы ещё не добавлены</p>
+                  <p className="text-xs text-slate-400 mt-1">Нажмите «Добавить документ» ниже, чтобы зафиксировать детали</p>
+                </div>
+              )}
+
+              {docs.length > 0 && (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead className="sticky top-0 z-10">
+                      <tr className="bg-slate-50 text-[11px] text-slate-500 font-semibold uppercase tracking-wide border-b border-slate-200">
+                        <th className="text-left px-4 py-2.5">#</th>
+                        <th className="text-left px-4 py-2.5 whitespace-nowrap">Дата</th>
+                        <th className="text-left px-4 py-2.5 whitespace-nowrap">№ документа</th>
+                        <th className="text-left px-4 py-2.5">Описание</th>
+                        <th className="text-right px-4 py-2.5 whitespace-nowrap">Сумма</th>
+                        <th className="text-left px-4 py-2.5">Период</th>
+                        <th className="text-left px-4 py-2.5">Система</th>
+                        <th className="text-left px-4 py-2.5">Заметки</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {docs.map((doc, i) => (
+                        <tr key={doc.id} className={`hover:bg-indigo-50/30 ${i % 2 ? 'bg-slate-50/20' : ''}`}>
+                          <td className="px-4 py-2.5 text-slate-400 font-mono text-xs">{i + 1}</td>
+                          <td className="px-4 py-2.5 text-xs font-medium text-slate-700 whitespace-nowrap">{fmtDate(doc.document_date)}</td>
+                          <td className="px-4 py-2.5 font-mono text-xs text-indigo-600 whitespace-nowrap">{doc.document_number ?? '—'}</td>
+                          <td className="px-4 py-2.5 text-xs text-slate-700 max-w-[180px]">
+                            <span className="block truncate" title={doc.description ?? undefined}>{doc.description ?? '—'}</span>
+                          </td>
+                          <td className="px-4 py-2.5 text-right font-mono text-xs font-semibold text-slate-700 whitespace-nowrap">
+                            {doc.amount != null ? doc.amount.toLocaleString('ru-RU') : '—'}
+                          </td>
+                          <td className="px-4 py-2.5 text-xs text-slate-600 whitespace-nowrap">{doc.period ?? '—'}</td>
+                          <td className="px-4 py-2.5"><SourcePill src={doc.system_source} /></td>
+                          <td className="px-4 py-2.5 text-xs text-slate-500 max-w-[150px]">
+                            <span className="block truncate" title={doc.notes ?? undefined}>{doc.notes ?? '—'}</span>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {showAddForm && (
+                <div className="px-6 py-5 border-t border-slate-100 bg-slate-50/50">
+                  <h3 className="text-sm font-semibold text-slate-700 mb-4">Новый документ</h3>
+                  {saveError && <p className="text-sm text-red-600 bg-red-50 px-3 py-2 rounded-lg mb-3">{saveError}</p>}
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <label className="block">
+                      <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Дата *</span>
+                      <input type="date" value={addForm.document_date}
+                        onChange={e => setAddForm(f => ({ ...f, document_date: e.target.value }))}
+                        className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                    </label>
+                    <label className="block">
+                      <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">№ документа</span>
+                      <input type="text" placeholder="ИНВ-001"
+                        value={addForm.document_number}
+                        onChange={e => setAddForm(f => ({ ...f, document_number: e.target.value }))}
+                        className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                    </label>
+                    <label className="block sm:col-span-2">
+                      <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Описание</span>
+                      <input type="text" placeholder="Краткое описание документа"
+                        value={addForm.description}
+                        onChange={e => setAddForm(f => ({ ...f, description: e.target.value }))}
+                        className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                    </label>
+                    <label className="block">
+                      <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Сумма</span>
+                      <input type="number" placeholder="0"
+                        value={addForm.amount}
+                        onChange={e => setAddForm(f => ({ ...f, amount: e.target.value }))}
+                        className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                    </label>
+                    <label className="block">
+                      <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Период</span>
+                      <input type="text" placeholder="июнь 2026"
+                        value={addForm.period}
+                        onChange={e => setAddForm(f => ({ ...f, period: e.target.value }))}
+                        className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                    </label>
+                    <label className="block sm:col-span-2">
+                      <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Заметки</span>
+                      <textarea rows={2} placeholder="Дополнительная информация"
+                        value={addForm.notes}
+                        onChange={e => setAddForm(f => ({ ...f, notes: e.target.value }))}
+                        className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 resize-none" />
+                    </label>
+                  </div>
+                  <div className="flex flex-wrap justify-between items-center mt-4 gap-2">
+                    <p className="text-xs text-slate-400">
+                      {params.company_name} · {DOC_TYPE_LABEL[params.document_type]} · {sysLabel}
+                    </p>
+                    <div className="flex gap-2">
+                      <button onClick={() => { setShowAddForm(false); setSaveError('') }}
+                        className="px-4 py-2 rounded-xl text-sm text-slate-600 hover:bg-slate-200 transition-colors">
+                        Отмена
+                      </button>
+                      <button onClick={handleSave} disabled={saving}
+                        className="px-5 py-2 rounded-xl text-sm font-semibold bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 transition-colors">
+                        {saving ? 'Сохранение…' : 'Сохранить'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="px-6 py-3.5 border-t border-slate-100 flex-shrink-0 flex justify-between items-center bg-slate-50/30">
+          <span className="text-xs text-slate-400">
+            {loading ? '…' : `${docs.length} ${docs.length === 1 ? 'документ' : docs.length < 5 ? 'документа' : 'документов'}`}
+          </span>
+          {!showAddForm && !loading && (
+            <button onClick={() => setShowAddForm(true)}
+              className="flex items-center gap-1.5 px-4 py-2 rounded-xl bg-indigo-600 text-white text-xs font-semibold hover:bg-indigo-700 transition-colors shadow-sm">
+              + Добавить документ
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─── Add Comment Modal ─────────────────────────────────────────────────────────
 
 type CommentForm = { accountant_name: string; company_name: string; comment: string; unaccounted_work: string }
 
@@ -147,21 +457,21 @@ function AddCommentModal({ employees, companies, onSave, onClose }: {
   )
 }
 
-// ─── Main Dashboard ───────────────────────────────────────────────────────────
+// ─── Main Dashboard ────────────────────────────────────────────────────────────
 
 type Tab = 'companies' | 'missing' | 'comments'
 
 export default function Dashboard() {
-  // ── Static data (loaded once) ────────────────────────────────────────────
-  const [employees, setEmployees]       = useState<Employee[]>([])
-  const [companies, setCompanies]       = useState<AccountingCompany[]>([])
+  // ── Static data (loaded once) ──────────────────────────────────────────────
+  const [employees,      setEmployees]  = useState<Employee[]>([])
+  const [companies,      setCompanies]  = useState<AccountingCompany[]>([])
   const [artemCompanies, setArtemComp]  = useState<ArtemCompany[]>([])
 
-  // ── Dynamic data (reloaded on filter change) ─────────────────────────────
-  const [activities, setActivities]     = useState<Activity[]>([])
-  const [comments, setComments]         = useState<DailyComment[]>([])
+  // ── Dynamic data (reloaded on filter change) ───────────────────────────────
+  const [activities, setActivities] = useState<Activity[]>([])
+  const [comments,   setComments]   = useState<DailyComment[]>([])
 
-  // ── Filters ──────────────────────────────────────────────────────────────
+  // ── UI state ───────────────────────────────────────────────────────────────
   const [dateFrom,    setDateFrom]      = useState(nDaysAgo(6))
   const [dateTo,      setDateTo]        = useState(today())
   const [accountant,  setAccountant]    = useState('all')
@@ -169,11 +479,12 @@ export default function Dashboard() {
   const [source,      setSource]        = useState('all')
   const [activeTab,   setActiveTab]     = useState<Tab>('companies')
   const [showModal,   setShowModal]     = useState(false)
+  const [detailModal, setDetailModal]   = useState<CellClickParams | null>(null)
 
   const [loadingStatic,  setLoadingStatic]  = useState(true)
   const [loadingDynamic, setLoadingDynamic] = useState(false)
 
-  // ── Load static data once ────────────────────────────────────────────────
+  // ── Load static data once ──────────────────────────────────────────────────
   useEffect(() => {
     Promise.all([
       fetch('/api/employees').then(r => r.json()),
@@ -186,7 +497,7 @@ export default function Dashboard() {
     }).finally(() => setLoadingStatic(false))
   }, [])
 
-  // ── Load dynamic data when filters change ────────────────────────────────
+  // ── Load dynamic data when filters change ──────────────────────────────────
   const loadDynamic = useCallback(() => {
     setLoadingDynamic(true)
     const ap = new URLSearchParams({ from: dateFrom, to: dateTo, accountant, company, source })
@@ -202,15 +513,39 @@ export default function Dashboard() {
 
   useEffect(() => { loadDynamic() }, [loadDynamic])
 
-  // ── Aggregate activities into company rows ───────────────────────────────
+  // ── Aggregate: ALL accounting companies + activity overlay ─────────────────
   const companyRows = useMemo<CompanyRow[]>(() => {
     const map = new Map<string, CompanyRow>()
+
+    // Pre-populate with every accounting company matching current filters
+    for (const c of companies) {
+      if (accountant !== 'all' && c.accountant_name !== accountant) continue
+      if (company !== 'all' && c.company_name !== company) continue
+      map.set(c.company_name, {
+        company_name: c.company_name,
+        accountant_name: c.accountant_name ?? '—',
+        base: emptyTotals(),
+        armsoft: emptyTotals(),
+        taxservice: emptyTotals(),
+        total: emptyTotals(),
+      })
+    }
+
+    // Overlay activity data (already server-filtered by accountant/company/source/dates)
     for (const a of activities) {
       let row = map.get(a.company_name)
       if (!row) {
-        row = { company_name: a.company_name, accountant_name: a.accountant_name, base: emptyTotals(), armsoft: emptyTotals(), taxservice: emptyTotals(), total: emptyTotals() }
+        row = {
+          company_name: a.company_name,
+          accountant_name: a.accountant_name,
+          base: emptyTotals(),
+          armsoft: emptyTotals(),
+          taxservice: emptyTotals(),
+          total: emptyTotals(),
+        }
         map.set(a.company_name, row)
       }
+      if (row.accountant_name === '—' && a.accountant_name) row.accountant_name = a.accountant_name
       const sys = row[a.system_source as 'base' | 'armsoft' | 'taxservice']
       sys.invoices     += a.invoices_issued
       sys.reports      += a.reports_submitted
@@ -221,30 +556,33 @@ export default function Dashboard() {
       row.total.applications += a.applications_filed
       row.total.balance      += a.balance_changes
     }
-    return Array.from(map.values()).sort((a, b) => a.company_name.localeCompare(b.company_name, 'ru'))
-  }, [activities])
 
-  // ── Global KPI totals ────────────────────────────────────────────────────
+    return Array.from(map.values()).sort((a, b) => a.company_name.localeCompare(b.company_name, 'ru'))
+  }, [activities, companies, accountant, company])
+
+  // ── Global KPI totals ──────────────────────────────────────────────────────
   const kpi = useMemo(() => companyRows.reduce(
     (acc, r) => ({ invoices: acc.invoices + r.total.invoices, reports: acc.reports + r.total.reports, applications: acc.applications + r.total.applications, balance: acc.balance + r.total.balance }),
     emptyTotals()
   ), [companyRows])
 
-  // ── Missing companies ─────────────────────────────────────────────────────
+  // ── Missing companies ──────────────────────────────────────────────────────
   const missingCompanies = useMemo(() => {
     const ourNames = new Set(companies.map(c => c.company_name.trim().toLowerCase()))
     return artemCompanies.filter(c => !ourNames.has(c.company_name.trim().toLowerCase()))
   }, [companies, artemCompanies])
 
-  // ── Add comment handler ──────────────────────────────────────────────────
-  const handleAddComment = async (form: { accountant_name: string; company_name: string; comment: string; unaccounted_work: string }) => {
-    const res = await fetch('/api/comments', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(form) })
+  // ── Add comment ────────────────────────────────────────────────────────────
+  const handleAddComment = async (form: CommentForm) => {
+    const res = await fetch('/api/comments', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(form),
+    })
     if (!res.ok) throw new Error((await res.json()).error)
     setShowModal(false)
     loadDynamic()
   }
 
-  // ── Preset ranges ────────────────────────────────────────────────────────
+  // ── Date presets ───────────────────────────────────────────────────────────
   const setPreset = (p: string) => {
     const t = today()
     if (p === 'today') { setDateFrom(t); setDateTo(t) }
@@ -261,12 +599,11 @@ export default function Dashboard() {
   return (
     <div className="min-h-screen bg-slate-50">
 
-      {/* ── Header ─────────────────────────────────────────────────────────── */}
+      {/* ── Header ────────────────────────────────────────────────────────── */}
       <header className="bg-white border-b border-slate-200 sticky top-0 z-30 shadow-sm">
         <div className="max-w-screen-2xl mx-auto px-4 sm:px-6 py-3">
           <div className="flex flex-wrap items-center gap-4 justify-between">
 
-            {/* Brand */}
             <div className="flex items-center gap-3 flex-shrink-0">
               <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-500 to-indigo-700 flex items-center justify-center text-white font-bold text-sm shadow">
                 OB
@@ -277,24 +614,19 @@ export default function Dashboard() {
               </div>
             </div>
 
-            {/* Filters */}
             <div className="flex flex-wrap items-center gap-2">
-
-              {/* Accountant */}
               <select value={accountant} onChange={e => setAccountant(e.target.value)}
                 className="border border-slate-200 rounded-xl px-3 py-2 text-xs bg-white focus:outline-none focus:ring-2 focus:ring-indigo-400">
                 <option value="all">Все бухгалтеры</option>
                 {employees.map(e => <option key={e.id} value={e.full_name}>{e.full_name}</option>)}
               </select>
 
-              {/* Company */}
               <select value={company} onChange={e => setCompanyFilter(e.target.value)}
                 className="border border-slate-200 rounded-xl px-3 py-2 text-xs bg-white focus:outline-none focus:ring-2 focus:ring-indigo-400">
                 <option value="all">Все компании</option>
                 {companies.map(c => <option key={c.id} value={c.company_name}>{c.company_name}</option>)}
               </select>
 
-              {/* Source */}
               <select value={source} onChange={e => setSource(e.target.value)}
                 className="border border-slate-200 rounded-xl px-3 py-2 text-xs bg-white focus:outline-none focus:ring-2 focus:ring-indigo-400">
                 <option value="all">Все системы</option>
@@ -303,7 +635,6 @@ export default function Dashboard() {
                 <option value="taxservice">ТаксСервис</option>
               </select>
 
-              {/* Date presets */}
               <div className="flex rounded-xl border border-slate-200 overflow-hidden text-[11px] font-semibold bg-white">
                 {[['today','Сегодня'],['week','7 дней'],['month','30 дней']].map(([k,l]) => (
                   <button key={k} onClick={() => setPreset(k)}
@@ -313,7 +644,6 @@ export default function Dashboard() {
                 ))}
               </div>
 
-              {/* Custom range */}
               <div className="flex items-center gap-1">
                 <input type="date" value={dateFrom} onChange={e => setDateFrom(e.target.value)}
                   className="border border-slate-200 rounded-xl px-2.5 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-indigo-400" />
@@ -330,21 +660,21 @@ export default function Dashboard() {
 
       <main className="max-w-screen-2xl mx-auto px-4 sm:px-6 py-6 space-y-6">
 
-        {/* ── KPI Cards ──────────────────────────────────────────────────────── */}
+        {/* ── KPI Cards ──────────────────────────────────────────────────── */}
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-4">
-          <KpiCard label="Выписано инвойсов"      value={kpi.invoices}     icon="🧾" accent="bg-emerald-50 text-emerald-600"
+          <KpiCard label="Выписано инвойсов"  value={kpi.invoices}     icon="🧾" accent="bg-emerald-50 text-emerald-600"
             sub={source !== 'all' ? SRC_LABEL[source] : 'все системы'} />
-          <KpiCard label="Сдано отчётности"       value={kpi.reports}      icon="📋" accent="bg-violet-50 text-violet-600"
+          <KpiCard label="Сдано отчётности"   value={kpi.reports}      icon="📋" accent="bg-violet-50 text-violet-600"
             sub={source !== 'all' ? SRC_LABEL[source] : 'все системы'} />
-          <KpiCard label="Подано заявлений"       value={kpi.applications} icon="📝" accent="bg-amber-50 text-amber-600"
+          <KpiCard label="Подано заявлений"   value={kpi.applications} icon="📝" accent="bg-amber-50 text-amber-600"
             sub={source !== 'all' ? SRC_LABEL[source] : 'все системы'} />
-          <KpiCard label="Изменений остатков"     value={kpi.balance}      icon="⚖️" accent="bg-rose-50 text-rose-600"
+          <KpiCard label="Изменений остатков" value={kpi.balance}      icon="⚖️" accent="bg-rose-50 text-rose-600"
             sub={source !== 'all' ? SRC_LABEL[source] : 'все системы'} />
-          <KpiCard label="Нет в бухгалтерии"      value={missingCompanies.length} icon="⚠️" accent="bg-orange-50 text-orange-500"
+          <KpiCard label="Нет в бухгалтерии"  value={missingCompanies.length} icon="⚠️" accent="bg-orange-50 text-orange-500"
             sub={`у Артема ${artemCompanies.length} · у нас ${companies.length}`} />
         </div>
 
-        {/* ── Tabs ───────────────────────────────────────────────────────────── */}
+        {/* ── Tabs ───────────────────────────────────────────────────────── */}
         <div className="border-b border-slate-200 flex gap-0">
           {([
             ['companies', `По компаниям (${companyRows.length})`],
@@ -362,7 +692,7 @@ export default function Dashboard() {
         </div>
 
         {/* ═══════════════════════════════════════════════════════════════════ */}
-        {/* TAB 1 — Companies                                                  */}
+        {/* TAB 1 — Companies                                                   */}
         {/* ═══════════════════════════════════════════════════════════════════ */}
         {activeTab === 'companies' && (
           <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
@@ -372,8 +702,9 @@ export default function Dashboard() {
                 {accountant !== 'all' && <span className="ml-2 text-indigo-600">· {accountant}</span>}
                 {source    !== 'all' && <span className="ml-2"><SourcePill src={source} /></span>}
               </h2>
-              <div className="flex gap-1.5">
+              <div className="flex gap-1.5 items-center">
                 <SourcePill src="base" /><SourcePill src="armsoft" /><SourcePill src="taxservice" />
+                <span className="text-xs text-slate-400 ml-2">Нажмите на число, чтобы увидеть документы</span>
               </div>
             </div>
 
@@ -390,19 +721,13 @@ export default function Dashboard() {
                       <th className="text-left px-5 py-3 whitespace-nowrap">Компания</th>
                       <th className="text-left px-4 py-3 whitespace-nowrap">Бухгалтер</th>
                       {source === 'all' || source === 'base' ? (
-                        <th className="text-center px-4 py-3 whitespace-nowrap bg-blue-50/60 border-x border-blue-100">
-                          База
-                        </th>
+                        <th className="text-center px-4 py-3 whitespace-nowrap bg-blue-50/60 border-x border-blue-100">База</th>
                       ) : null}
                       {source === 'all' || source === 'armsoft' ? (
-                        <th className="text-center px-4 py-3 whitespace-nowrap bg-violet-50/60 border-x border-violet-100">
-                          АрмСофт
-                        </th>
+                        <th className="text-center px-4 py-3 whitespace-nowrap bg-violet-50/60 border-x border-violet-100">АрмСофт</th>
                       ) : null}
                       {source === 'all' || source === 'taxservice' ? (
-                        <th className="text-center px-4 py-3 whitespace-nowrap bg-emerald-50/60 border-x border-emerald-100">
-                          ТаксСервис
-                        </th>
+                        <th className="text-center px-4 py-3 whitespace-nowrap bg-emerald-50/60 border-x border-emerald-100">ТаксСервис</th>
                       ) : null}
                       <th className="text-center px-4 py-3 whitespace-nowrap font-bold text-slate-700">Итого</th>
                     </tr>
@@ -437,48 +762,63 @@ export default function Dashboard() {
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100">
-                    {companyRows.map((row, i) => (
-                      <tr key={row.company_name} className={`hover:bg-indigo-50/30 transition-colors ${i % 2 ? 'bg-slate-50/30' : ''}`}>
-                        <td className="px-5 py-3 font-medium text-slate-800 whitespace-nowrap">{row.company_name}</td>
-                        <td className="px-4 py-3 whitespace-nowrap">
-                          <div className="flex items-center gap-2">
-                            <Avatar name={row.accountant_name} />
-                            <span className="text-xs text-slate-600">{row.accountant_name}</span>
-                          </div>
-                        </td>
-                        {source === 'all' || source === 'base' ? (
-                          <td className="px-4 py-3 bg-blue-50/30 border-x border-blue-100"><MetricGrid t={row.base} /></td>
-                        ) : null}
-                        {source === 'all' || source === 'armsoft' ? (
-                          <td className="px-4 py-3 bg-violet-50/30 border-x border-violet-100"><MetricGrid t={row.armsoft} /></td>
-                        ) : null}
-                        {source === 'all' || source === 'taxservice' ? (
-                          <td className="px-4 py-3 bg-emerald-50/30 border-x border-emerald-100"><MetricGrid t={row.taxservice} /></td>
-                        ) : null}
-                        <td className="px-4 py-3">
-                          <div className="grid grid-cols-4 gap-x-3 text-xs text-right min-w-[130px]">
-                            <span className="font-bold text-slate-900">{row.total.invoices}</span>
-                            <span className="font-bold text-slate-900">{row.total.reports}</span>
-                            <span className="font-bold text-slate-900">{row.total.applications}</span>
-                            <span className="font-bold text-slate-900">{row.total.balance}</span>
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
+                    {companyRows.map((row, i) => {
+                      const ctx = (sys: string): MetricContext => ({
+                        company_name: row.company_name,
+                        accountant_name: row.accountant_name,
+                        system_source: sys,
+                        date_from: dateFrom,
+                        date_to: dateTo,
+                      })
+                      return (
+                        <tr key={row.company_name} className={`hover:bg-indigo-50/30 transition-colors ${i % 2 ? 'bg-slate-50/30' : ''}`}>
+                          <td className="px-5 py-3 font-medium text-slate-800 whitespace-nowrap">{row.company_name}</td>
+                          <td className="px-4 py-3 whitespace-nowrap">
+                            <div className="flex items-center gap-2">
+                              <Avatar name={row.accountant_name} />
+                              <span className="text-xs text-slate-600">{row.accountant_name}</span>
+                            </div>
+                          </td>
+                          {source === 'all' || source === 'base' ? (
+                            <td className="px-4 py-3 bg-blue-50/30 border-x border-blue-100">
+                              <MetricGrid t={row.base} context={ctx('base')} onCellClick={setDetailModal} />
+                            </td>
+                          ) : null}
+                          {source === 'all' || source === 'armsoft' ? (
+                            <td className="px-4 py-3 bg-violet-50/30 border-x border-violet-100">
+                              <MetricGrid t={row.armsoft} context={ctx('armsoft')} onCellClick={setDetailModal} />
+                            </td>
+                          ) : null}
+                          {source === 'all' || source === 'taxservice' ? (
+                            <td className="px-4 py-3 bg-emerald-50/30 border-x border-emerald-100">
+                              <MetricGrid t={row.taxservice} context={ctx('taxservice')} onCellClick={setDetailModal} />
+                            </td>
+                          ) : null}
+                          <td className="px-4 py-3">
+                            <div className="grid grid-cols-4 gap-x-3 text-xs text-right min-w-[130px]">
+                              <span className="font-bold text-slate-900 tabular-nums">{row.total.invoices}</span>
+                              <span className="font-bold text-slate-900 tabular-nums">{row.total.reports}</span>
+                              <span className="font-bold text-slate-900 tabular-nums">{row.total.applications}</span>
+                              <span className="font-bold text-slate-900 tabular-nums">{row.total.balance}</span>
+                            </div>
+                          </td>
+                        </tr>
+                      )
+                    })}
                   </tbody>
                   {companyRows.length > 1 && (
                     <tfoot>
                       <tr className="bg-indigo-50 border-t-2 border-indigo-200 text-xs font-bold text-slate-700">
                         <td className="px-5 py-3" colSpan={2}>Итого</td>
-                        {source === 'all' || source === 'base'       ? <td className="px-4 py-3 bg-blue-50/50 border-x border-blue-100" /> : null}
-                        {source === 'all' || source === 'armsoft'    ? <td className="px-4 py-3 bg-violet-50/50 border-x border-violet-100" /> : null}
-                        {source === 'all' || source === 'taxservice' ? <td className="px-4 py-3 bg-emerald-50/50 border-x border-emerald-100" /> : null}
+                        {source === 'all' || source === 'base'        ? <td className="px-4 py-3 bg-blue-50/50 border-x border-blue-100" /> : null}
+                        {source === 'all' || source === 'armsoft'     ? <td className="px-4 py-3 bg-violet-50/50 border-x border-violet-100" /> : null}
+                        {source === 'all' || source === 'taxservice'  ? <td className="px-4 py-3 bg-emerald-50/50 border-x border-emerald-100" /> : null}
                         <td className="px-4 py-3">
                           <div className="grid grid-cols-4 gap-x-3 text-right min-w-[130px]">
-                            <span className="text-indigo-700">{kpi.invoices}</span>
-                            <span className="text-violet-700">{kpi.reports}</span>
-                            <span className="text-amber-700">{kpi.applications}</span>
-                            <span className="text-rose-700">{kpi.balance}</span>
+                            <span className="text-indigo-700 tabular-nums">{kpi.invoices}</span>
+                            <span className="text-violet-700 tabular-nums">{kpi.reports}</span>
+                            <span className="text-amber-700 tabular-nums">{kpi.applications}</span>
+                            <span className="text-rose-700 tabular-nums">{kpi.balance}</span>
                           </div>
                         </td>
                       </tr>
@@ -491,7 +831,7 @@ export default function Dashboard() {
         )}
 
         {/* ═══════════════════════════════════════════════════════════════════ */}
-        {/* TAB 2 — Missing companies                                          */}
+        {/* TAB 2 — Missing companies                                           */}
         {/* ═══════════════════════════════════════════════════════════════════ */}
         {activeTab === 'missing' && (
           <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
@@ -560,7 +900,7 @@ export default function Dashboard() {
         )}
 
         {/* ═══════════════════════════════════════════════════════════════════ */}
-        {/* TAB 3 — Daily comments                                             */}
+        {/* TAB 3 — Daily comments                                              */}
         {/* ═══════════════════════════════════════════════════════════════════ */}
         {activeTab === 'comments' && (
           <div className="bg-white rounded-2xl border border-slate-200 shadow-sm overflow-hidden">
@@ -619,7 +959,6 @@ export default function Dashboard() {
           </div>
         )}
 
-        {/* ── Footer ─────────────────────────────────────────────────────────── */}
         <footer className="text-center text-xs text-slate-400 pb-4">
           OB Accounting Dashboard · OB Artyom + OB FAQ Supabase · Обновлено при изменении фильтров
         </footer>
@@ -631,6 +970,13 @@ export default function Dashboard() {
           companies={companies}
           onSave={handleAddComment}
           onClose={() => setShowModal(false)}
+        />
+      )}
+
+      {detailModal && (
+        <DocumentDetailModal
+          params={detailModal}
+          onClose={() => setDetailModal(null)}
         />
       )}
     </div>
