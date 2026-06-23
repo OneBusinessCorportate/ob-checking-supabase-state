@@ -43,6 +43,13 @@ const DOC_TYPE_ICON: Record<DocType, string> = {
   balance_change: '⚖️',
 }
 
+const DOC_FIELD: Record<DocType, 'invoices_issued' | 'reports_submitted' | 'applications_filed' | 'balance_changes'> = {
+  invoice: 'invoices_issued',
+  report: 'reports_submitted',
+  application: 'applications_filed',
+  balance_change: 'balance_changes',
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function today() { return new Date().toISOString().split('T')[0] }
@@ -145,8 +152,9 @@ function MetricGrid({ t, dim, context, onCellClick }: {
 // ─── Document Detail Modal ─────────────────────────────────────────────────────
 
 function DocumentDetailModal({ params, onClose }: { params: CellClickParams; onClose: () => void }) {
-  const [docs, setDocs] = useState<DocumentRecord[]>([])
-  const [loading, setLoading] = useState(true)
+  const [acts, setActs]   = useState<Activity[]>([])
+  const [docs, setDocs]   = useState<DocumentRecord[]>([])
+  const [loading, setLoading]       = useState(true)
   const [fetchError, setFetchError] = useState('')
   const [showAddForm, setShowAddForm] = useState(false)
   const [addForm, setAddForm] = useState({
@@ -157,24 +165,43 @@ function DocumentDetailModal({ params, onClose }: { params: CellClickParams; onC
     period: '',
     notes: '',
   })
-  const [saving, setSaving] = useState(false)
+  const [saving, setSaving]     = useState(false)
   const [saveError, setSaveError] = useState('')
 
-  const fetchDocs = useCallback(async () => {
+  const fetchAll = useCallback(async () => {
     setLoading(true); setFetchError('')
     try {
-      const p = new URLSearchParams({
+      const ap = new URLSearchParams({
+        from: params.date_from,
+        to: params.date_to,
+        company: params.company_name,
+        accountant: params.accountant_name !== '—' ? params.accountant_name : 'all',
+      })
+      if (params.system_source !== 'all') ap.set('source', params.system_source)
+
+      const dp = new URLSearchParams({
         company_name: params.company_name,
         document_type: params.document_type,
         from: params.date_from,
         to: params.date_to,
       })
-      if (params.system_source && params.system_source !== 'all') p.set('system_source', params.system_source)
-      if (params.accountant_name && params.accountant_name !== '—') p.set('accountant_name', params.accountant_name)
-      const res = await fetch(`/api/documents?${p}`)
-      const data = await res.json()
-      if (!res.ok) { setFetchError(data.error ?? 'Ошибка загрузки'); return }
-      setDocs(Array.isArray(data) ? data : [])
+      if (params.system_source !== 'all') dp.set('system_source', params.system_source)
+      if (params.accountant_name !== '—') dp.set('accountant_name', params.accountant_name)
+
+      const [ar, dr] = await Promise.all([
+        fetch(`/api/activities?${ap}`),
+        fetch(`/api/documents?${dp}`),
+      ])
+      const [actData, docData] = await Promise.all([ar.json(), dr.json()])
+      if (!ar.ok) { setFetchError(actData.error ?? 'Ошибка'); return }
+      if (!dr.ok) { setFetchError(docData.error ?? 'Ошибка'); return }
+
+      const field = DOC_FIELD[params.document_type]
+      const relevant = (Array.isArray(actData) ? actData as Activity[] : [])
+        .filter(a => (a[field] as number) > 0)
+        .sort((a, b) => b.activity_date.localeCompare(a.activity_date))
+      setActs(relevant)
+      setDocs(Array.isArray(docData) ? docData : [])
     } catch (e) {
       setFetchError(String(e))
     } finally {
@@ -182,7 +209,7 @@ function DocumentDetailModal({ params, onClose }: { params: CellClickParams; onC
     }
   }, [params])
 
-  useEffect(() => { fetchDocs() }, [fetchDocs])
+  useEffect(() => { fetchAll() }, [fetchAll])
 
   const handleSave = async () => {
     setSaving(true); setSaveError('')
@@ -207,7 +234,7 @@ function DocumentDetailModal({ params, onClose }: { params: CellClickParams; onC
       if (!res.ok) { const e = await res.json(); throw new Error(e.error ?? 'Ошибка') }
       setShowAddForm(false)
       setAddForm({ document_number: '', document_date: today(), description: '', amount: '', period: '', notes: '' })
-      fetchDocs()
+      fetchAll()
     } catch (e) {
       setSaveError(String(e))
     } finally {
@@ -215,7 +242,11 @@ function DocumentDetailModal({ params, onClose }: { params: CellClickParams; onC
     }
   }
 
-  const sysLabel = params.system_source !== 'all' ? (SRC_LABEL[params.system_source] ?? params.system_source) : 'Все системы'
+  const sysLabel = params.system_source !== 'all'
+    ? (SRC_LABEL[params.system_source] ?? params.system_source)
+    : 'Все системы'
+  const field = DOC_FIELD[params.document_type]
+  const totalCount = acts.reduce((s, a) => s + (a[field] as number), 0)
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4" onClick={onClose}>
@@ -256,117 +287,166 @@ function DocumentDetailModal({ params, onClose }: { params: CellClickParams; onC
             <div className="px-6 py-8 text-center text-rose-500 text-sm">{fetchError}</div>
           ) : (
             <>
-              {docs.length === 0 && !showAddForm && (
-                <div className="text-center py-16 text-slate-400">
-                  <p className="text-5xl mb-3">📄</p>
-                  <p className="text-sm font-medium text-slate-600">Документы ещё не добавлены</p>
-                  <p className="text-xs text-slate-400 mt-1">Нажмите «Добавить документ» ниже, чтобы зафиксировать детали</p>
+              {/* ── Section 1: Activity breakdown ── */}
+              <div className="border-b border-slate-100">
+                <div className="px-5 py-2.5 bg-slate-50 flex items-center justify-between">
+                  <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">
+                    Активность по дням
+                  </span>
+                  {acts.length > 0 && (
+                    <span className="text-xs font-bold text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded-full">
+                      итого: {totalCount}
+                    </span>
+                  )}
                 </div>
-              )}
-
-              {docs.length > 0 && (
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
-                    <thead className="sticky top-0 z-10">
-                      <tr className="bg-slate-50 text-[11px] text-slate-500 font-semibold uppercase tracking-wide border-b border-slate-200">
-                        <th className="text-left px-4 py-2.5">#</th>
-                        <th className="text-left px-4 py-2.5 whitespace-nowrap">Дата</th>
-                        <th className="text-left px-4 py-2.5 whitespace-nowrap">№ документа</th>
-                        <th className="text-left px-4 py-2.5">Описание</th>
-                        <th className="text-right px-4 py-2.5 whitespace-nowrap">Сумма</th>
-                        <th className="text-left px-4 py-2.5">Период</th>
-                        <th className="text-left px-4 py-2.5">Система</th>
-                        <th className="text-left px-4 py-2.5">Заметки</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100">
-                      {docs.map((doc, i) => (
-                        <tr key={doc.id} className={`hover:bg-indigo-50/30 ${i % 2 ? 'bg-slate-50/20' : ''}`}>
-                          <td className="px-4 py-2.5 text-slate-400 font-mono text-xs">{i + 1}</td>
-                          <td className="px-4 py-2.5 text-xs font-medium text-slate-700 whitespace-nowrap">{fmtDate(doc.document_date)}</td>
-                          <td className="px-4 py-2.5 font-mono text-xs text-indigo-600 whitespace-nowrap">{doc.document_number ?? '—'}</td>
-                          <td className="px-4 py-2.5 text-xs text-slate-700 max-w-[180px]">
-                            <span className="block truncate" title={doc.description ?? undefined}>{doc.description ?? '—'}</span>
-                          </td>
-                          <td className="px-4 py-2.5 text-right font-mono text-xs font-semibold text-slate-700 whitespace-nowrap">
-                            {doc.amount != null ? doc.amount.toLocaleString('ru-RU') : '—'}
-                          </td>
-                          <td className="px-4 py-2.5 text-xs text-slate-600 whitespace-nowrap">{doc.period ?? '—'}</td>
-                          <td className="px-4 py-2.5"><SourcePill src={doc.system_source} /></td>
-                          <td className="px-4 py-2.5 text-xs text-slate-500 max-w-[150px]">
-                            <span className="block truncate" title={doc.notes ?? undefined}>{doc.notes ?? '—'}</span>
-                          </td>
+                {acts.length === 0 ? (
+                  <div className="px-5 py-5 text-center text-slate-400 text-xs">Нет активностей за выбранный период</div>
+                ) : (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="text-[11px] text-slate-500 font-semibold uppercase tracking-wide border-b border-slate-100">
+                          <th className="text-left px-5 py-2">Дата</th>
+                          <th className="text-left px-4 py-2">Бухгалтер</th>
+                          <th className="text-left px-4 py-2">Система</th>
+                          <th className="text-right px-5 py-2">Кол-во</th>
                         </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-
-              {showAddForm && (
-                <div className="px-6 py-5 border-t border-slate-100 bg-slate-50/50">
-                  <h3 className="text-sm font-semibold text-slate-700 mb-4">Новый документ</h3>
-                  {saveError && <p className="text-sm text-red-600 bg-red-50 px-3 py-2 rounded-lg mb-3">{saveError}</p>}
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <label className="block">
-                      <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Дата *</span>
-                      <input type="date" value={addForm.document_date}
-                        onChange={e => setAddForm(f => ({ ...f, document_date: e.target.value }))}
-                        className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
-                    </label>
-                    <label className="block">
-                      <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">№ документа</span>
-                      <input type="text" placeholder="ИНВ-001"
-                        value={addForm.document_number}
-                        onChange={e => setAddForm(f => ({ ...f, document_number: e.target.value }))}
-                        className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
-                    </label>
-                    <label className="block sm:col-span-2">
-                      <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Описание</span>
-                      <input type="text" placeholder="Краткое описание документа"
-                        value={addForm.description}
-                        onChange={e => setAddForm(f => ({ ...f, description: e.target.value }))}
-                        className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
-                    </label>
-                    <label className="block">
-                      <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Сумма</span>
-                      <input type="number" placeholder="0"
-                        value={addForm.amount}
-                        onChange={e => setAddForm(f => ({ ...f, amount: e.target.value }))}
-                        className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
-                    </label>
-                    <label className="block">
-                      <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Период</span>
-                      <input type="text" placeholder="июнь 2026"
-                        value={addForm.period}
-                        onChange={e => setAddForm(f => ({ ...f, period: e.target.value }))}
-                        className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
-                    </label>
-                    <label className="block sm:col-span-2">
-                      <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Заметки</span>
-                      <textarea rows={2} placeholder="Дополнительная информация"
-                        value={addForm.notes}
-                        onChange={e => setAddForm(f => ({ ...f, notes: e.target.value }))}
-                        className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 resize-none" />
-                    </label>
+                      </thead>
+                      <tbody className="divide-y divide-slate-50">
+                        {acts.map(a => (
+                          <tr key={a.id} className="hover:bg-indigo-50/20">
+                            <td className="px-5 py-2.5 text-xs font-semibold text-slate-700 whitespace-nowrap">{fmtDate(a.activity_date)}</td>
+                            <td className="px-4 py-2.5">
+                              <div className="flex items-center gap-1.5">
+                                <Avatar name={a.accountant_name} />
+                                <span className="text-xs text-slate-600">{a.accountant_name}</span>
+                              </div>
+                            </td>
+                            <td className="px-4 py-2.5"><SourcePill src={a.system_source} /></td>
+                            <td className="px-5 py-2.5 text-right">
+                              <span className="text-sm font-bold text-indigo-700 tabular-nums">{a[field] as number}</span>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
                   </div>
-                  <div className="flex flex-wrap justify-between items-center mt-4 gap-2">
-                    <p className="text-xs text-slate-400">
-                      {params.company_name} · {DOC_TYPE_LABEL[params.document_type]} · {sysLabel}
-                    </p>
-                    <div className="flex gap-2">
-                      <button onClick={() => { setShowAddForm(false); setSaveError('') }}
-                        className="px-4 py-2 rounded-xl text-sm text-slate-600 hover:bg-slate-200 transition-colors">
-                        Отмена
-                      </button>
-                      <button onClick={handleSave} disabled={saving}
-                        className="px-5 py-2 rounded-xl text-sm font-semibold bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 transition-colors">
-                        {saving ? 'Сохранение…' : 'Сохранить'}
-                      </button>
+                )}
+              </div>
+
+              {/* ── Section 2: Attached documents ── */}
+              <div>
+                <div className="px-5 py-2.5 bg-slate-50 flex items-center justify-between">
+                  <span className="text-[11px] font-semibold text-slate-500 uppercase tracking-wide">
+                    Прикреплённые документы
+                  </span>
+                  {docs.length > 0 && (
+                    <span className="text-xs text-slate-400">{docs.length} шт.</span>
+                  )}
+                </div>
+
+                {docs.length === 0 && !showAddForm ? (
+                  <div className="px-5 py-5 text-center text-slate-400 text-xs">
+                    Документы не прикреплены — нажмите «Добавить документ»
+                  </div>
+                ) : docs.length > 0 && (
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="text-[11px] text-slate-500 font-semibold uppercase tracking-wide border-b border-slate-100">
+                          <th className="text-left px-4 py-2">#</th>
+                          <th className="text-left px-4 py-2 whitespace-nowrap">Дата</th>
+                          <th className="text-left px-4 py-2 whitespace-nowrap">№ документа</th>
+                          <th className="text-left px-4 py-2">Описание</th>
+                          <th className="text-right px-4 py-2 whitespace-nowrap">Сумма</th>
+                          <th className="text-left px-4 py-2">Период</th>
+                          <th className="text-left px-4 py-2">Заметки</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-50">
+                        {docs.map((doc, i) => (
+                          <tr key={doc.id} className={`hover:bg-indigo-50/20 ${i % 2 ? 'bg-slate-50/20' : ''}`}>
+                            <td className="px-4 py-2.5 text-slate-400 font-mono text-xs">{i + 1}</td>
+                            <td className="px-4 py-2.5 text-xs font-medium text-slate-700 whitespace-nowrap">{fmtDate(doc.document_date)}</td>
+                            <td className="px-4 py-2.5 font-mono text-xs text-indigo-600 whitespace-nowrap">{doc.document_number ?? '—'}</td>
+                            <td className="px-4 py-2.5 text-xs text-slate-700 max-w-[180px]">
+                              <span className="block truncate" title={doc.description ?? undefined}>{doc.description ?? '—'}</span>
+                            </td>
+                            <td className="px-4 py-2.5 text-right font-mono text-xs font-semibold text-slate-700 whitespace-nowrap">
+                              {doc.amount != null ? doc.amount.toLocaleString('ru-RU') : '—'}
+                            </td>
+                            <td className="px-4 py-2.5 text-xs text-slate-600 whitespace-nowrap">{doc.period ?? '—'}</td>
+                            <td className="px-4 py-2.5 text-xs text-slate-500 max-w-[150px]">
+                              <span className="block truncate" title={doc.notes ?? undefined}>{doc.notes ?? '—'}</span>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                {showAddForm && (
+                  <div className="px-6 py-5 border-t border-slate-100 bg-slate-50/50">
+                    <h3 className="text-sm font-semibold text-slate-700 mb-4">Новый документ</h3>
+                    {saveError && <p className="text-sm text-red-600 bg-red-50 px-3 py-2 rounded-lg mb-3">{saveError}</p>}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <label className="block">
+                        <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Дата *</span>
+                        <input type="date" value={addForm.document_date}
+                          onChange={e => setAddForm(f => ({ ...f, document_date: e.target.value }))}
+                          className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                      </label>
+                      <label className="block">
+                        <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">№ документа</span>
+                        <input type="text" placeholder="ИНВ-001"
+                          value={addForm.document_number}
+                          onChange={e => setAddForm(f => ({ ...f, document_number: e.target.value }))}
+                          className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                      </label>
+                      <label className="block sm:col-span-2">
+                        <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Описание</span>
+                        <input type="text" placeholder="Краткое описание документа"
+                          value={addForm.description}
+                          onChange={e => setAddForm(f => ({ ...f, description: e.target.value }))}
+                          className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                      </label>
+                      <label className="block">
+                        <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Сумма</span>
+                        <input type="number" placeholder="0"
+                          value={addForm.amount}
+                          onChange={e => setAddForm(f => ({ ...f, amount: e.target.value }))}
+                          className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                      </label>
+                      <label className="block">
+                        <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Период</span>
+                        <input type="text" placeholder="июнь 2026"
+                          value={addForm.period}
+                          onChange={e => setAddForm(f => ({ ...f, period: e.target.value }))}
+                          className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500" />
+                      </label>
+                      <label className="block sm:col-span-2">
+                        <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Заметки</span>
+                        <textarea rows={2} placeholder="Дополнительная информация"
+                          value={addForm.notes}
+                          onChange={e => setAddForm(f => ({ ...f, notes: e.target.value }))}
+                          className="mt-1 w-full border border-slate-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 resize-none" />
+                      </label>
+                    </div>
+                    <div className="flex flex-wrap justify-between items-center mt-4 gap-2">
+                      <p className="text-xs text-slate-400">{params.company_name} · {DOC_TYPE_LABEL[params.document_type]} · {sysLabel}</p>
+                      <div className="flex gap-2">
+                        <button onClick={() => { setShowAddForm(false); setSaveError('') }}
+                          className="px-4 py-2 rounded-xl text-sm text-slate-600 hover:bg-slate-200 transition-colors">Отмена</button>
+                        <button onClick={handleSave} disabled={saving}
+                          className="px-5 py-2 rounded-xl text-sm font-semibold bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 transition-colors">
+                          {saving ? 'Сохранение…' : 'Сохранить'}
+                        </button>
+                      </div>
                     </div>
                   </div>
-                </div>
-              )}
+                )}
+              </div>
             </>
           )}
         </div>
@@ -374,7 +454,7 @@ function DocumentDetailModal({ params, onClose }: { params: CellClickParams; onC
         {/* Footer */}
         <div className="px-6 py-3.5 border-t border-slate-100 flex-shrink-0 flex justify-between items-center bg-slate-50/30">
           <span className="text-xs text-slate-400">
-            {loading ? '…' : `${docs.length} ${docs.length === 1 ? 'документ' : docs.length < 5 ? 'документа' : 'документов'}`}
+            {loading ? '…' : `${acts.length} ${acts.length === 1 ? 'запись' : acts.length < 5 ? 'записи' : 'записей'} активности · ${docs.length} документов`}
           </span>
           {!showAddForm && !loading && (
             <button onClick={() => setShowAddForm(true)}
