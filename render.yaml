@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: ob-accounting-dashboard
+    runtime: node
+    region: frankfurt
+    plan: free
+
+    # Build
+    buildCommand: npm install && npm run build
+
+    # Start
+    startCommand: npm start
+
+    # Port Next.js listens on
+    healthCheckPath: /
+
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "3000"
+
+      # OB Artyom — accounting data
+      - key: ARTYOM_SUPABASE_URL
+        value: https://rbtvbsbcycdlwmrzjwun.supabase.co
+      - key: ARTYOM_SUPABASE_ANON_KEY
+        value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJidHZic2JjeWNkbHdtcnpqd3VuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAzOTg2MDYsImV4cCI6MjA5NTk3NDYwNn0.Aw6cLYNiQRNVahANyUkXehFwQI9oyUW9Hj2xjELWwk0
+      - key: ARTYOM_SUPABASE_SERVICE_ROLE_KEY
+        sync: false   # Set manually in Render dashboard — never commit this value
+
+      # OB FAQ — employees / accountants
+      - key: FAQ_SUPABASE_URL
+        value: https://fjsogozwseqoxgddjeig.supabase.co
+      - key: FAQ_SUPABASE_ANON_KEY
+        value: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZqc29nb3p3c2Vxb3hnZGRqZWlnIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njk2OTU1MjEsImV4cCI6MjA4NTI3MTUyMX0.Xy9u77KTap0Tfj7MN99VQgrjYnmaiCK8WdFeCsJlyDw
+      - key: FAQ_SUPABASE_SERVICE_ROLE_KEY
+        sync: false   # Set manually in Render dashboard — never commit this value
